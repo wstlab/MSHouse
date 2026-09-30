@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MSHouse 镜像家居 · 智能家居数字孪生教学</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2b15a'/%3E%3Cpath d='M8 16l8-6 8 6v9H8z' fill='%231b1408'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <canvas id="viewport"></canvas>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark">MS</div>
+      <div>
+        <h1>MSHouse · 镜像家居</h1>
+        <p>Mirror Space · 智能家居教学沙盘 · 物模型 + WebSocket + 流</p>
+      </div>
+    </div>
+    <div class="scenes" id="scenes"></div>
+    <button class="chip" id="setupBtn" type="button">初始化设置</button>
+    <button class="chip on" id="menuToggle" type="button" aria-pressed="true">控制菜单</button>
+  </header>
+
+  <div class="hud">
+    <div class="pill"><span class="dot" id="linkDot"></span><b id="linkText">连接中</b></div>
+    <div class="pill">在家状态 <b id="occupancy">—</b></div>
+    <div class="pill">室外 <b id="outdoor">—</b></div>
+    <div class="pill">设备在线 <b id="onlineCount">0/0</b></div>
+  </div>
+
+  <aside class="panel">
+    <nav class="tabs" id="tabs">
+      <button data-pane="control" class="active">控制</button>
+      <button data-pane="status">状态</button>
+      <button data-pane="video">画面</button>
+      <button data-pane="wire">报文</button>
+    </nav>
+    <section class="pane active" id="pane-control"></section>
+    <section class="pane" id="pane-status">
+      <div id="statusList"></div>
+      <h3 class="meta" style="margin:14px 4px 8px">事件日志</h3>
+      <div class="log" id="eventLog"></div>
+    </section>
+    <section class="pane" id="pane-video">
+      <div class="card">
+        <header><h3>客厅云台</h3><span class="meta" id="camBadge">流 · 待机</span></header>
+        <div class="video-box">
+          <span class="tag">CH 233666</span>
+          <img id="camStream" alt="客厅云台视频流" />
+        </div>
+        <p class="meta" id="camMeta" style="margin-top:8px">等待流信令…</p>
+        <div class="row" style="margin-top:10px">
+          <button class="mini" id="camOn">推送画面</button>
+          <button class="mini" id="camOff">停止推送</button>
+          <button class="mini" id="camOpen">新窗口打开流</button>
+        </div>
+      </div>
+      <div class="card">
+        <header><h3>大门人脸锁</h3><span class="meta" id="lockBadge">流 · 待机</span></header>
+        <div class="video-box">
+          <span class="tag">CH 233667</span>
+          <img id="lockStream" alt="大门人脸锁视频流" />
+        </div>
+        <p class="meta" id="lockMeta" style="margin-top:8px">等待流信令…</p>
+        <div class="row" style="margin-top:10px">
+          <button class="mini" id="lockOn">推送画面</button>
+          <button class="mini" id="lockOff">停止推送</button>
+          <button class="mini" id="lockOpen">新窗口打开流</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="mini" id="faceResident">模拟住户人脸</button>
+          <button class="mini" id="faceGuest">模拟访客</button>
+          <button class="mini" id="lockNow">上锁</button>
+        </div>
+      </div>
+      <p class="meta" style="margin:10px 4px 0;line-height:1.6">
+        画面走独立 HTTP 流，不占用 WebSocket：
+        <code>GET /?stream=233666</code> 返回 MJPEG，浏览器 <code>&lt;img&gt;</code> 直接能播。
+      </p>
+    </section>
+    <section class="pane" id="pane-wire">
+      <div class="row" style="margin-bottom:8px">
+        <button class="mini" id="clearWire">清空</button>
+        <button class="mini" id="pingBtn">发送 ping</button>
+        <span class="meta" id="wireCount">0 条</span>
+      </div>
+      <div class="wire" id="wireLog"></div>
+    </section>
+  </aside>
+
+  <div class="floor-switch">
+    <button class="chip on" id="floorAll" data-floor="all">全屋</button>
+    <button class="chip" id="floor1" data-floor="1">一层</button>
+    <button class="chip" id="floor2" data-floor="2">二层</button>
+    <button class="chip" id="roofToggle">掀开屋顶</button>
+  </div>
+  <div class="legend">
+    <span class="swatch" style="background:#e2b15a"></span>灯
+    <span class="swatch" style="background:#8ecae6"></span>传感
+    <span class="swatch" style="background:#7dcea0"></span>空调
+    <span class="swatch" style="background:#e07a5f"></span>摄像 / 门锁
+    · 拖拽旋转 · 滚轮缩放 · 点击设备
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <dialog class="setup" id="setupDialog">
+    <form method="dialog" id="setupForm">
+      <header>
+        <h2>初始化设置</h2>
+        <p>写入别墅物理位置，并用该地天气预报初始化室外温度。</p>
+      </header>
+      <label>口令
+        <input id="setupPassword" type="password" name="password" autocomplete="current-password" required placeholder="教学口令 villa" />
+      </label>
+      <label>地点名称
+        <input id="setupName" name="name" maxlength="40" placeholder="例如 杭州 · 西湖" />
+      </label>
+      <div class="pair">
+        <label>纬度
+          <input id="setupLat" name="lat" type="number" step="0.0001" min="-90" max="90" required placeholder="30.2741" />
+        </label>
+        <label>经度
+          <input id="setupLon" name="lon" type="number" step="0.0001" min="-180" max="180" required placeholder="120.1551" />
+        </label>
+      </div>
+      <div class="row">
+        <button class="mini" type="button" id="setupGeo">使用当前位置</button>
+        <span class="meta" id="setupHint">口令校验在网关侧完成，通过后拉取公开预报。</span>
+      </div>
+      <p class="setup-error" id="setupError" hidden></p>
+      <footer>
+        <button class="mini" type="button" id="setupCancel">取消</button>
+        <button class="primary" type="submit" id="setupSubmit">写入并初始化</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Three.js 已本地内置到 /vendor，离线也能跑；只需给裸模块名 three 做映射 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three.module.js"
+      }
+    }
+  </script>
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "mshouse",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MSHouse 镜像家居 · Mirror Space 智能家居数字孪生教学场景",
+  "scripts": {
+    "start": "node server/index.js",
+    "check": "node scripts/selfcheck.js"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "ws": "^8.18.0"
+  }
+}
