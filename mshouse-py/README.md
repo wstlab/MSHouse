@@ -60,6 +60,8 @@ mshouse-py/
 ├── scripts/
 │   ├── export_model.py    从 model.py 生成 shared/model.js
 │   └── selfcheck.py       协议自检（31 项）
+├── integrations/
+│   └── ha_bridge.py       Home Assistant 桥接（MQTT Discovery，零侵入）
 └── requirements.txt
 ```
 
@@ -250,9 +252,12 @@ Python 这边用 Pillow（C 实现）把它压到 0.5 ms 以内，所以整体�
 2. **看报文**：打开「报文」面板，观察一条 `command` 如何变成 `ack` + `state` + `video` 信令。
 3. **改物模型**：在 `server/model.py` 里加一台设备，跑 `python scripts/export_model.py`，
    再在前端 `public/js/scene.js` 注册一个渲染器 —— 体会「一份物模型，两种呈现」。
-4. **接真实设备**：把 `gateway.py` 里的 `_execute` 换成 MQTT publish，把 `render/` 换成
-   真实摄像头的 `/video.cgi`，上层协议完全不用动。
-5. **对照实验**：用 `scripts/selfcheck.py` 当验收标准，试着把某个命令的语义改掉，
+4. **接标准生态**：`integrations/ha_bridge.py` 已经把这座虚拟别墅接进了 Home Assistant
+   —— 34 个实体自动出现，全程零改动 `server/` 代码。它顺带演示了「私有协议网关 → 标准
+   协议网关」的适配过程，见 [docs/HA_INTEGRATION.md](docs/HA_INTEGRATION.md)。
+5. **接真实设备**：把 `gateway.py` 里的 `_execute` 换成真实设备 SDK 调用，把 `render/`
+   换成真实摄像头的 `/video.cgi`，上层协议完全不用动。
+6. **对照实验**：用 `scripts/selfcheck.py` 当验收标准，试着把某个命令的语义改掉，
    看哪几项断言会失败。
 
 ---
@@ -262,5 +267,7 @@ Python 这边用 Pillow（C 实现）把它压到 0.5 ms 以内，所以整体�
 | 文件 | 内容 |
 |---|---|
 | [docs/INTEGRATION.md](docs/INTEGRATION.md) | 客户端接入指南：如何取传感器、控设备、订阅视频流 |
+| [docs/HA_INTEGRATION.md](docs/HA_INTEGRATION.md) | 接入 Home Assistant：MQTT Discovery 桥接、实体映射、自动化示例 |
+| `integrations/ha_bridge.py` | HA 桥接器，可运行（34 个实体，零侵入） |
 | `public/demo.html` | 可直接运行的最小客户端示例 |
 | `scripts/selfcheck.py` | 协议自检，同时是一份完整的交互示例代码 |

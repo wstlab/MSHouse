@@ -9,6 +9,10 @@
 #                       这是 Python 版性能反超 Node 版的关键）
 #   httpx               调用 Open-Meteo 取天气预报
 #   websockets          协议自检脚本用的 WebSocket 客户端
+#
+# 可选（只在跑 Home Assistant 桥接时才需要）：
+#   pip install paho-mqtt
+#   paho-mqtt           integrations/ha_bridge.py 用的 MQTT 客户端
 
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
