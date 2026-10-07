@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mshouse"
+version = "1.0.0"
+description = "MSHouse 镜像家居 · Mirror Space 智能家居数字孪生教学场景（Python 后端）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["digital-twin", "iot", "smart-home", "teaching", "mjpeg", "websocket"]
+dependencies = [
+    "fastapi>=0.110,<1.0",
+    "uvicorn[standard]>=0.29,<1.0",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "httpx>=0.27",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+mshouse = "server.main:main"
+
+[tool.setuptools]
+packages = ["server", "server.render"]
+
+[tool.setuptools.package-data]
+server = ["../public/*", "../shared/*"]

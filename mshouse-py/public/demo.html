@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MSHouse 镜像家居 · 第三方客户端 Demo</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%238ecae6'/%3E%3Cpath d='M9 22l7-6 7 6V10H9z' fill='%230c1210'/%3E%3C/svg%3E" />
+<!--
+  ============================================================================
+  这是一个「最小可用」的第三方客户端。
+  它刻意写成单文件、零依赖：直接双击用浏览器打开就能用，也可以拷到任何地方托管。
+  它不引用主应用的任何 JS/CSS，只通过 WebSocket 与网关对话 —— 用来证明
+  「三维场景」和「设备协议」是两层，谁都可以单独写一个客户端接进来。
+
+  视频画面走的是独立的 HTTP 流通道（/?stream=通道名），不经 WebSocket：
+  WebSocket 只传「该拉流了、地址是什么」这类信令，像素由 <img> 直接消费。
+
+  想改造成自己的程序？只要保留下面 TwinClient 这一个类即可，
+  界面部分全部可以删掉（见 docs/INTEGRATION.md 第二节）。
+  ============================================================================
+-->
+<style>
+  :root {
+    --bg: #0c1210; --card: #131d1a; --line: rgba(214,196,160,.16);
+    --ink: #f3efe6; --muted: #a7b3ab; --gold: #e2b15a;
+    --ok: #7dcea0; --warn: #e2b15a; --danger: #ef6f6c; --sky: #8ecae6;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 "Avenir Next", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+  button, input, select, textarea { font-family: inherit; font-size: inherit; }
+  button { cursor: pointer; }
+
+  header {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 14px 18px; background: rgba(12,18,16,.94);
+    border-bottom: 1px solid var(--line); backdrop-filter: blur(10px);
+  }
+  header h1 { margin: 0; font-size: 16px; white-space: nowrap; }
+  header .sub { color: var(--muted); font-size: 12px; margin-right: auto; }
+  .field { display: flex; gap: 6px; align-items: center; }
+  input[type="text"] {
+    background: #18241f; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 10px; min-width: 260px;
+  }
+  button.btn {
+    border: 1px solid var(--line); background: rgba(255,255,255,.05); color: var(--ink);
+    border-radius: 10px; padding: 8px 13px; transition: 140ms ease;
+  }
+  button.btn:hover { transform: translateY(-1px); }
+  button.btn.primary {
+    border-color: transparent; font-weight: 700; color: #1b1408;
+    background: linear-gradient(180deg, rgba(226,177,90,.95), rgba(196,140,62,.92));
+  }
+  button.btn.on { border-color: transparent; background: var(--gold); color: #1b1408; font-weight: 700; }
+  button.btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+  button.btn.sm { padding: 4px 10px; font-size: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); display: inline-block; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 9px var(--ok); }
+  .dot.wait { background: var(--gold); }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,420px); gap: 14px; padding: 14px 18px 40px; }
+  @media (max-width: 1080px) { main { grid-template-columns: 1fr; } }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 14px; margin-bottom: 12px; }
+  .card > header { position: static; padding: 0; background: none; border: 0; backdrop-filter: none; margin-bottom: 10px; }
+  .card h2 { margin: 0; font-size: 14px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+
+  /* ---------- 视频流 ---------- */
+  .streams { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .stream { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0e1614; }
+  .stream .frame { position: relative; aspect-ratio: 16 / 10; background: #070b0a; }
+  .stream img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .stream .badge {
+    font-size: 11px; font-weight: 700; white-space: nowrap;
+    padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.08); color: var(--muted);
+  }
+  .stream .badge.live { color: #1b1408; background: var(--ok); }
+  .stream .meta { padding: 9px 10px; display: flex; flex-direction: column; gap: 6px; }
+  .stream .meta .name-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .stream .meta .name { font-weight: 700; font-size: 13px; }
+  .stream .meta .stat { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .stream .meta .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .stream .meta .acts button { flex: 1; min-width: 84px; }
+
+  /* ---------- 标签页 ---------- */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .tabs button {
+    border: 0; background: none; color: var(--muted); font-weight: 700;
+    padding: 9px 16px; border-radius: 10px 10px 0 0; transition: 140ms ease;
+  }
+  .tabs button:hover { color: var(--ink); }
+  .tabs button.active { color: var(--ink); background: rgba(255,255,255,.06); box-shadow: inset 0 -2px 0 var(--gold); }
+  .tabs .count {
+    display: inline-block; margin-left: 7px; padding: 1px 7px; border-radius: 999px;
+    background: rgba(255,255,255,.08); font-size: 11px; font-weight: 600; color: var(--muted);
+  }
+  .tabs button.active .count { background: rgba(226,177,90,.22); color: var(--gold); }
+
+  .dev { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: rgba(255,255,255,.02); }
+  .dev header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .dev h3 { margin: 0; font-size: 14px; }
+  .dev .ctrl { display: grid; gap: 8px; margin-top: 10px; }
+  .dev label { display: grid; grid-template-columns: 62px 1fr 54px; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .dev label > b { text-align: right; color: var(--ink); font-weight: 600; }
+  input[type="range"] { width: 100%; accent-color: var(--gold); }
+  select { background: #18241f; color: var(--ink); border: 1px solid var(--line); border-radius: 9px; padding: 6px 8px; }
+  .readout { font-family: var(--mono); font-size: 20px; }
+  .pill { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 11.5px; color: var(--muted); }
+  .pill b { color: var(--ink); }
+
+  /* ---------- 感知卡片 ---------- */
+  .sense { display: flex; gap: 10px; align-items: flex-start; transition: 160ms ease; }
+  .sense.off { opacity: .52; }
+  .sense input[type="checkbox"] { width: 17px; height: 17px; margin: 3px 0 0; accent-color: var(--gold); cursor: pointer; flex: none; }
+  .sense .body { flex: 1; min-width: 0; }
+  .sense h3 { margin: 0 0 2px; font-size: 14px; }
+  .sense .val { font-family: var(--mono); font-size: 18px; margin-top: 6px; }
+  .sense .note { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .sense .flag { font-size: 11px; margin-top: 6px; }
+  .sense .flag.on { color: var(--ok); }
+  .sense .flag.off { color: var(--warn); }
+
+  /* ---------- 执行卡片 ---------- */
+  .act .now { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px; }
+  details.sample { margin-top: 10px; border-top: 1px dashed rgba(255,255,255,.09); padding-top: 8px; }
+  details.sample summary { cursor: pointer; color: var(--gold); font-size: 12px; font-weight: 600; user-select: none; }
+  details.sample pre {
+    margin: 8px 0; padding: 9px; background: #0a0f0d; border: 1px solid var(--line);
+    border-radius: 10px; font-family: var(--mono); font-size: 11px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all; max-height: 210px; overflow: auto; color: #cfdbd4;
+  }
+
+  /* ---------- 报文 / 执行框 ---------- */
+  .log { font-family: var(--mono); font-size: 11.5px; max-height: 260px; overflow: auto; }
+  .log div { padding: 5px 2px; border-bottom: 1px dashed rgba(255,255,255,.07); }
+  .lv-info { color: var(--sky); } .lv-ok { color: var(--ok); }
+  .lv-warn { color: var(--warn); } .lv-alarm { color: var(--danger); }
+  .wire { font-family: var(--mono); font-size: 11px; max-height: 340px; overflow: auto; }
+  .wire div { padding: 5px 2px; border-bottom: 1px dashed rgba(255,255,255,.07); }
+  .wire .out { color: var(--gold); } .wire .in { color: var(--sky); }
+  .wire pre { margin: 3px 0 0; white-space: pre-wrap; word-break: break-all; color: #cfdbd4; }
+  .wire .blocked { color: var(--muted); }
+  .filterbar { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+
+  textarea {
+    width: 100%; min-height: 104px; resize: vertical; background: #0a0f0d; color: var(--ink);
+    border: 1px solid var(--line); border-radius: 12px; padding: 10px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  }
+  textarea:focus { outline: none; border-color: rgba(226,177,90,.55); }
+  textarea::placeholder { color: #5d6a63; }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(10px);
+    background: var(--ink); color: #1b1408; padding: 9px 15px; border-radius: 999px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: 200ms ease; z-index: 9;
+    max-width: 80vw;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.bad { background: var(--danger); color: #fff; }
+  .hint { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+  code { font-family: var(--mono); background: rgba(255,255,255,.06); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+  .empty { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; padding: 22px 4px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MSHouse 镜像家居 · 客户端 Demo</h1>
+  <span class="sub">只依赖 WebSocket 与 HTTP 流，不依赖主应用的任何代码</span>
+  <div class="field">
+    <input type="text" id="server" spellcheck="false" placeholder="http://localhost:8080" />
+    <button class="btn primary" id="connect">连接</button>
+  </div>
+  <div class="row"><span class="dot" id="dot"></span><span class="muted" id="status">未连接</span></div>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>场景模式</h2>
+        <span class="muted">场景是服务端的批量操作，客户端只发一个 id</span>
+      </header>
+      <div class="row" id="scenes"></div>
+    </div>
+
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>视频流</h2>
+        <span class="muted">像素走 HTTP 流，不走 WebSocket</span>
+      </header>
+      <div class="streams" id="streams"><div class="muted">连接后自动接流…</div></div>
+      <p class="hint">
+        每路流是一条独立的 HTTP 长连接，地址形如 <code>/?stream=通道名</code>，用原生 <code>&lt;img&gt;</code> 就能播。
+        通道常在线：未推流时显示待机画面，点「推送画面」后自动切成实景，<b>页面不用刷新</b>。
+      </p>
+    </div>
+
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>设备</h2>
+        <span class="muted" id="overview">未连接</span>
+      </header>
+
+      <div class="tabs" id="tabs">
+        <button data-tab="sense" class="active">感知<span class="count" id="cntSense">0</span></button>
+        <button data-tab="act">执行<span class="count" id="cntAct">0</span></button>
+      </div>
+
+      <div id="paneSense">
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn sm" id="senseAll">全部勾选</button>
+          <button class="btn sm" id="senseNone">全部取消</button>
+          <span class="muted" id="senseSummary"></span>
+        </div>
+        <div class="grid2" id="gridSense"><div class="empty">点击右上角「连接」接入网关</div></div>
+      </div>
+
+      <div id="paneAct" hidden>
+        <div class="grid2" id="gridAct"><div class="empty">点击右上角「连接」接入网关</div></div>
+      </div>
+
+      <p class="hint" id="devHint"></p>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>事件日志</h2>
+        <button class="btn sm" id="clearEvents">清空</button>
+      </header>
+      <div class="log" id="events"><div class="muted">等待事件…</div></div>
+    </div>
+
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>发送报文</h2>
+        <span class="muted">缺 <code>v</code> / <code>id</code> / <code>ts</code> 会自动补齐</span>
+      </header>
+      <textarea id="execBox" spellcheck="false" placeholder='粘贴或编写一条完整报文，例如：
+{
+  "type": "command",
+  "payload": { "deviceId": "light.living", "action": "set", "params": { "power": true, "brightness": 80 } }
+}'></textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="execSend">发送</button>
+        <button class="btn sm" id="execFormat">格式化</button>
+        <button class="btn sm" id="execClear">清空</button>
+        <span class="muted">也支持 <code>scene</code> / <code>snapshot</code> / <code>ping</code> / <code>setup</code></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <header class="row" style="justify-content:space-between">
+        <h2>WebSocket 报文</h2>
+        <span class="muted" id="wireCount">0 条</span>
+      </header>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn sm" id="ping">发送 ping</button>
+        <button class="btn sm" id="resync">拉全量快照</button>
+        <button class="btn sm" id="clearWire">清空</button>
+        <span class="filterbar" id="wireFilter"></span>
+      </div>
+      <div class="wire" id="wire"><div class="muted">连接后这里会显示真实收发的 JSON。</div></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ==========================================================================
+ * 第 1 部分：协议客户端（这部分可以整段拷到你的项目里）
+ * ========================================================================== */
+
+const PROTOCOL_VERSION = "1.1";
+let seq = 1;
+const nextId = (p = "c") => `${p}-${Date.now().toString(36)}-${seq++}`;
+
+/** 统一信封：所有上行消息都用这个格式，网关靠 type 分发、靠 id 回执 */
+function envelope(type, payload = {}, extra = {}) {
+  return { v: PROTOCOL_VERSION, type, ts: Date.now(), ...extra, payload };
+}
+
+/**
+ * 把用户填的地址规范成 WebSocket 地址。
+ * 接受 http://host:port、host:port、ws://... 三种写法。
+ */
+function toWsUrl(raw) {
+  let s = String(raw || "").trim();
+  if (!s) return null;
+  if (!/^[a-z]+:\/\//i.test(s)) s = "http://" + s;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+  if (!u.pathname || u.pathname === "/") u.pathname = "/ws";
+  return u.toString();
+}
+
+/**
+ * 同一个服务器地址，转成 HTTP 基址 —— 视频流走 HTTP，不走 WebSocket。
+ * 像素通道与信令通道是两条独立的路：WebSocket 告诉你「该拉流了、地址是什么」，
+ * HTTP 流才是画面本身。详见 docs/INTEGRATION.md 第八节。
+ */
+function toHttpBase(raw) {
+  const ws = toWsUrl(raw);
+  if (!ws) return null;
+  const u = new URL(ws);
+  u.protocol = u.protocol === "wss:" ? "https:" : "http:";
+  return u.origin;
+}
+
+class TwinClient {
+  constructor({ onMessage, onOpen, onClose } = {}) {
+    this.ws = null;
+    this.onMessage = onMessage || (() => {});
+    this.onOpen = onOpen || (() => {});
+    this.onClose = onClose || (() => {});
+    this.devices = new Map();     // deviceId -> 设备影子（含 state）
+    this.scene = null;
+    this.site = null;
+    this.outdoor = null;
+    this._manual = true;          // 默认不连接：必须显式调用 connect()
+    this._retry = 0;
+    this._retryTimer = null;
+  }
+
+  get connected() { return this.ws?.readyState === 1; }
+
+  connect(url) {
+    this.close(true);
+    this._manual = false;
+    this.url = url;
+    const ws = new WebSocket(url);
+    this.ws = ws;
+
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this._retry = 0;
+      this.onOpen();
+    };
+    ws.onerror = () => { /* 交给 onclose 统一处理重连 */ };
+    ws.onclose = () => {
+      if (this.ws !== ws) return;          // 已被新连接取代，忽略旧 socket
+      this.ws = null;
+      this.onClose();
+      if (this._manual) return;            // 主动断开：不重连
+      // 断线重连：真实项目里应该用指数退避 + 抖动
+      this._retry += 1;
+      const delay = Math.min(8000, 600 * this._retry);
+      this._retryTimer = setTimeout(() => { if (!this._manual) this.connect(this.url); }, delay);
+    };
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      this._absorb(msg);
+      this.onMessage(msg);
+    };
+  }
+
+  /**
+   * 关闭连接。silent=true 时保留本地设备影子（断开后界面仍可显示最后一次快照）。
+   * 这里主动摘掉回调再关闭，避免旧 socket 的 onclose 触发重连；返回值表示「之前确实有连接」。
+   */
+  close(silent) {
+    const ws = this.ws;
+    this._manual = true;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+    this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onerror = ws.onmessage = ws.onclose = null;
+      try { ws.close(); } catch {}
+    }
+    if (!silent) { this.devices.clear(); this.scene = null; }
+    return !!ws;
+  }
+
+  /** 用户主动断开：关闭并通知界面（不会自动重连） */
+  disconnect() {
+    if (this.close(true)) this.onClose();
+  }
+
+  /** 把下行消息同步进本地影子，这样界面永远读的是「最后已知状态」 */
+  _absorb(msg) {
+    const p = msg.payload;
+    switch (msg.type) {
+      case "snapshot":
+        this.devices.clear();
+        for (const d of p.devices || []) this.devices.set(d.id, d);
+        this.scene = p.scene;
+        this.site = p.site;
+        this.outdoor = p.outdoor;
+        break;
+      case "state": {
+        const d = this.devices.get(p.deviceId);
+        if (d) d.state = p.state;      // 增量：只覆盖 state，其它元数据不动
+        break;
+      }
+      case "scene":
+        this.scene = p.sceneId;
+        break;
+      case "setup":
+        this.site = p.site;
+        this.outdoor = p.outdoor;
+        break;
+      default:
+        break;
+    }
+  }
+
+  send(type, payload) { return this._raw(envelope(type, payload)); }
+
+  /** 控制设备：action 见 docs/INTEGRATION.md 第五节 */
+  command(deviceId, action, params = {}) {
+    return this.send("command", { deviceId, action, params });
+  }
+
+  setScene(sceneId) { return this.send("scene", { sceneId }); }
+  ping() { return this.send("ping", { at: Date.now() }); }
+  resync() { return this.send("snapshot", {}); }
+
+  /** 原样发送一条报文（执行框用），不重新封装 */
+  sendRaw(msg) { return this._raw(msg); }
+
+  _raw(msg) {
+    if (!this.connected) return false;
+    this.ws.send(JSON.stringify(msg));
+    this._lastOut = msg;
+    return true;
+  }
+}
+
+/* ==========================================================================
+ * 第 2 部分：界面（可以整段删掉，不影响上面的客户端）
+ * ========================================================================== */
+
+const $ = (s) => document.querySelector(s);
+const TYPE_LABEL = { light: "智能灯", sensor: "温湿度", ac: "空调", camera: "摄像头", lock: "人脸锁" };
+const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bath: "卫生间", entry: "门厅" };
+const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
+const FAN_LABEL = { low: "低风", mid: "中风", high: "高风", auto: "自动" };
+const SCENE_LABEL = { home: "回家", away: "离家", sleep: "睡眠", movie: "观影" };
+
+/**
+ * 设备角色划分 —— 这个 demo 的教学主线。
+ *   sense：会产生数据流（遥测读数 / 流信令 / 识别记录），勾选后它的报文才会出现在报文面板。
+ *   act  ：可下发命令，提供「报文样例」供复制粘贴到执行框。
+ * 摄像头与人脸锁两者兼具：既推流（感知），也接受控制命令（执行）。
+ * 这正是真实物联网里常见的情形 —— 一台设备可以同时是感知设备与执行设备。
+ */
+const ROLE = {
+  sensor: { sense: true, act: false },
+  camera: { sense: true, act: true },
+  lock: { sense: true, act: true },
+  light: { sense: false, act: true },
+  ac: { sense: false, act: true },
+};
+const isSense = (d) => !!ROLE[d.type]?.sense;
+const isAct = (d) => !!ROLE[d.type]?.act;
+
+const SENSE_HINT = "勾选某台设备，它的报文（传感器读数、流信令、识别记录）才会出现在右侧「WebSocket 报文」面板；未勾选的会被过滤掉（只影响之后的报文）。注意：画面本身不走 WebSocket —— 勾选只决定信令报文是否显示，上方「视频流」卡片始终在播。";
+const ACT_HINT = "展开任意设备的「报文样例」→ 点「填入执行框」→ 到右侧点「发送」，就能看到一条真实命令走完整个链路。摄像头与人脸锁同时也出现在「感知」标签里 —— 它们既推流也受控；它们的样例发的是 stream 指令，和上方流卡片按钮发的是同一种命令。";
+
+const cards = new Map();      // deviceId -> [同步函数]
+const senseOn = new Map();    // deviceId -> 是否勾选（默认 false：必须主动打勾）
+let wireCount = 0;
+let filteredCount = 0;
+
+function toast(text, bad) {
+  const t = $("#toast");
+  t.textContent = text;
+  t.classList.toggle("bad", !!bad);
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+/* ---------- 报文面板 ---------- */
+
+/** 报文是否放行：未勾选的「感知设备」相关报文一律过滤 */
+function wirePass(msg) {
+  const p = msg.payload || {};
+  const devId = p.deviceId || p.source;
+  if (!devId || !senseOn.has(devId)) return true;   // 非感知设备 / 非设备报文
+  return senseOn.get(devId) === true;
+}
+
+function updateWireFilter() {
+  const host = $("#wireFilter");
+  if (host) {
+    const off = [...senseOn.values()].filter((v) => !v).length;
+    host.textContent = filteredCount
+      ? `累计过滤 ${filteredCount} 条 · 当前 ${off} 台感知设备未勾选`
+      : off
+        ? `${off} 台感知设备未勾选，其报文已被过滤`
+        : "感知设备报文全部显示中";
+  }
+  // 面板空着且是被过滤掉的，给一句明确提示，避免看起来像坏了
+  const wire = $("#wire");
+  if (wire && !wire.children.length) {
+    wire.innerHTML = filteredCount
+      ? '<div class="muted">报文都被过滤了 —— 到左侧「感知」标签勾选设备后即可看到。</div>'
+      : '<div class="muted">连接后这里会显示真实收发的 JSON。</div>';
+  }
+}
+
+function addWire(dir, msg, blocked) {
+  if (dir === "in" && blocked) {
+    filteredCount += 1;
+    updateWireFilter();
+    return;
+  }
+  wireCount += 1;
+  $("#wireCount").textContent = `${wireCount} 条`;
+  const host = $("#wire");
+  if (host.firstChild?.classList?.contains("muted")) host.innerHTML = "";
+  const row = document.createElement("div");
+  const label = document.createElement("span");
+  label.className = dir;
+  label.textContent = dir === "out" ? "↑ 发出 " : "↓ 收到 ";
+  const pre = document.createElement("pre");
+  // 流信令只在状态变化时广播，不会刷屏，可以直接全量打印
+  pre.textContent = JSON.stringify(msg, null, 1);
+  row.append(label, pre);
+  host.prepend(row);
+  while (host.children.length > 60) host.lastChild.remove();
+}
+
+function addEvent(e) {
+  const host = $("#events");
+  if (host.firstChild?.classList?.contains("muted")) host.innerHTML = "";
+  const row = document.createElement("div");
+  const time = new Date(e.ts || Date.now()).toLocaleTimeString("zh-CN", { hour12: false });
+  const lv = document.createElement("span");
+  lv.className = `lv-${e.level || "info"}`;
+  lv.textContent = `[${(e.level || "info").toUpperCase()}]`;
+  row.append(`${time} `, lv, ` ${e.message || ""}`);
+  host.prepend(row);
+  while (host.children.length > 80) host.lastChild.remove();
+}
+
+function registerCard(id, fn) {
+  if (!cards.has(id)) cards.set(id, []);
+  cards.get(id).push(fn);
+}
+
+/* ---------- 视频流卡片：播放 MJPEG 通道 + 流控制 ---------- */
+
+/** 通道状态：deviceId -> { channel, streaming, live, viewers, fps } */
+const streamState = new Map();
+let streamCards = new Map();          // deviceId -> paint()
+
+/** 通道播放地址：/?stream=<通道名>，与 WebSocket 地址同一个主机 */
+function streamUrl(channel) {
+  const base = client.url ? toHttpBase(client.url) : null;
+  return base && channel ? `${base}/?stream=${channel}` : "";
+}
+
+function upsertStream(deviceId, patch) {
+  streamState.set(deviceId, { ...(streamState.get(deviceId) || {}), ...patch });
+  streamCards.get(deviceId)?.();
+}
+
+function buildStreamCard(d) {
+  const root = document.createElement("div");
+  root.className = "stream";
+
+  const frame = document.createElement("div");
+  frame.className = "frame";
+  const img = document.createElement("img");
+  img.alt = d.name;
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  frame.append(img);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const nameRow = document.createElement("div");
+  nameRow.className = "name-row";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = d.name;
+  nameRow.append(name, badge);
+  const stat = document.createElement("div");
+  stat.className = "stat";
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  const onBtn = document.createElement("button");
+  onBtn.className = "btn sm primary";
+  onBtn.textContent = "推送画面";
+  const offBtn = document.createElement("button");
+  offBtn.className = "btn sm";
+  offBtn.textContent = "停止推送";
+  const openBtn = document.createElement("button");
+  openBtn.className = "btn sm";
+  openBtn.textContent = "新窗口打开";
+  acts.append(onBtn, offBtn, openBtn);
+  meta.append(nameRow, stat, acts);
+  root.append(frame, meta);
+
+  // 这三个按钮走的就是最普通的设备指令：action = "stream"
+  onBtn.addEventListener("click", () => client.command(d.id, "stream", { on: true }));
+  offBtn.addEventListener("click", () => client.command(d.id, "stream", { on: false }));
+  openBtn.addEventListener("click", () => {
+    const url = streamUrl(d.channel);
+    if (url) window.open(url, "_blank");
+    else toast("先连接网关，才能拿到流地址", true);
+  });
+
+  const paint = () => {
+    const st = streamState.get(d.id) || {};
+    const url = streamUrl(d.channel);
+    // 只在地址变化时重设 src —— 重设会重建流连接
+    if (url && img.dataset.src !== url) { img.dataset.src = url; img.src = url; }
+    badge.textContent = st.live ? "LIVE" : "STANDBY";
+    badge.classList.toggle("live", !!st.live);
+    stat.textContent = `CH ${d.channel} · ${st.live ? "推流中" : "待机"} · 观众 ${st.viewers ?? 0} · ${st.fps ?? 0}fps`;
+    onBtn.disabled = st.streaming === true;
+    offBtn.disabled = st.streaming !== true;
+  };
+  paint();
+  streamCards.set(d.id, paint);
+  return root;
+}
+
+function renderStreams(devices) {
+  const host = $("#streams");
+  const withChannel = devices.filter((d) => d.channel);
+  streamCards = new Map();
+  host.innerHTML = "";
+  if (!withChannel.length) {
+    host.innerHTML = '<div class="muted">网关未上报带流通道的设备</div>';
+    return;
+  }
+  for (const d of withChannel) {
+    streamState.set(d.id, {
+      channel: d.channel,
+      streaming: !!d.state?.streaming,
+      live: !!d.stream?.live,
+      viewers: d.stream?.viewers ?? 0,
+      fps: d.stream?.fps ?? 0,
+    });
+    host.appendChild(buildStreamCard(d));
+  }
+}
+
+/* ---------- 感知卡片：只读展示 + 报文过滤开关 ---------- */
+
+function buildSenseCard(d) {
+  const root = document.createElement("div");
+  root.className = "dev sense";
+
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = senseOn.get(d.id) === true;
+  cb.title = "勾选后，该设备的报文才会出现在右侧报文面板";
+
+  const body = document.createElement("div");
+  body.className = "body";
+  const h = document.createElement("h3");
+  h.textContent = d.name;
+  const tag = document.createElement("div");
+  tag.className = "muted";
+  tag.textContent = `${TYPE_LABEL[d.type] || d.type} · ${ROOM_LABEL[d.room] || d.room} · F${d.floor}${isAct(d) ? " · 可控制" : " · 只读"}`;
+  const val = document.createElement("div");
+  val.className = "val";
+  const note = document.createElement("div");
+  note.className = "note";
+  const flag = document.createElement("div");
+  flag.className = "flag";
+  body.append(h, tag, val, note, flag);
+
+  const paint = () => {
+    const on = cb.checked;
+    root.classList.toggle("off", !on);
+    flag.className = `flag ${on ? "on" : "off"}`;
+    flag.textContent = on ? "✓ 报文显示中" : "✕ 报文已过滤";
+    updateWireFilter();
+  };
+  cb.addEventListener("change", () => { senseOn.set(d.id, cb.checked); paint(); });
+  paint();
+
+  const sync = (s) => {
+    if (d.type === "sensor") {
+      val.textContent = `${(s.temperature ?? 0).toFixed(1)}°C / ${Math.round(s.humidity ?? 0)}%RH`;
+      note.textContent = `${s.comfort || ""} · 遥测上报`;
+    } else if (d.type === "camera") {
+      val.textContent = `${s.streaming ? "推流中" : "待机"} · 云台 ${Math.round(s.pan ?? 0)}°`;
+      note.textContent = `${s.armed ? "布防" : "撤防"}${s.motion ? " · 检测到移动" : ""} · 流通道 ${d.channel || "--"}`;
+    } else if (d.type === "lock") {
+      val.textContent = `${s.locked ? "已上锁" : "已开锁"} · 电量 ${s.battery ?? "--"}%`;
+      note.textContent = `${s.streaming ? "门禁画面推送中" : "门禁画面待机"}${s.lastPerson ? " · 最近 " + s.lastPerson : ""} · 流通道 ${d.channel || "--"}`;
+    }
+  };
+  sync(d.state || {});
+
+  root.append(cb, body);
+  registerCard(d.id, sync);
+  return root;
+}
+
+/* ---------- 执行卡片：状态摘要 + 可复制的报文样例 ---------- */
+
+function stateSummary(d) {
+  const s = d.state || {};
+  switch (d.type) {
+    case "light":
+      return s.power
+        ? `开 · 亮度 ${Math.round(s.brightness ?? 0)}% · 色温 ${Math.round(s.colorTemp ?? 4000)}K`
+        : "关";
+    case "ac":
+      return `${s.power ? "运行中" : "已关闭"} · ${MODE_LABEL[s.mode] || s.mode || "--"} · 设定 ${Math.round(s.targetTemp ?? 0)}°C · 室内 ${(s.indoorTemp ?? 0).toFixed(1)}°C`;
+    case "camera":
+      return `${s.streaming ? "推流中" : "待机"} · 云台 ${Math.round(s.pan ?? 0)}° · ${s.armed ? "布防" : "撤防"}`;
+    case "lock":
+      return `${s.locked ? "已上锁" : "已开锁"} · 电量 ${s.battery ?? "--"}%${s.lastPerson ? " · " + s.lastPerson : ""}`;
+    default:
+      return "";
+  }
+}
+
+/** 按设备当前状态生成一条「立刻可用」的命令样例 */
+function sampleFor(d) {
+  const s = d.state || {};
+  const cmd = (action, params) => envelope("command", { deviceId: d.id, action, params }, { id: nextId("cmd") });
+  switch (d.type) {
+    case "light":
+      return cmd("set", { power: !s.power, brightness: s.power ? 0 : 80, colorTemp: 4000 });
+    case "ac":
+      return cmd("set", { power: true, mode: "cool", fan: "low", targetTemp: 25 });
+    case "camera":
+      // 样例给的是流指令：与上方「视频流」卡片的按钮等价，便于对照
+      return s.streaming ? cmd("stream", { on: false }) : cmd("stream", { on: true });
+    case "lock":
+      return cmd("face", { faceId: "resident.lin" });
+    default:
+      return cmd("set", {});
+  }
+}
+
+function buildActCard(d) {
+  const root = document.createElement("div");
+  root.className = "dev act";
+
+  const head = document.createElement("header");
+  const title = document.createElement("h3");
+  title.textContent = d.name;
+  const tag = document.createElement("span");
+  tag.className = "muted";
+  tag.textContent = `${TYPE_LABEL[d.type] || d.type} · ${ROOM_LABEL[d.room] || d.room} · F${d.floor}`;
+  head.append(title, tag);
+
+  const now = document.createElement("div");
+  now.className = "now";
+  const paint = (s) => { now.textContent = `当前：${stateSummary(d)}`; };
+  paint(d.state || {});
+
+  const det = document.createElement("details");
+  det.className = "sample";
+  const sum = document.createElement("summary");
+  sum.textContent = "报文样例";
+  const pre = document.createElement("pre");
+  const row = document.createElement("div");
+  row.className = "row";
+  const copy = document.createElement("button");
+  copy.className = "btn sm"; copy.textContent = "复制";
+  const fill = document.createElement("button");
+  fill.className = "btn sm primary"; fill.textContent = "填入执行框";
+  row.append(copy, fill);
+  det.append(sum, pre, row);
+
+  // 展开时才生成，保证样例反映的是「此刻」的状态
+  const render = () => { pre.textContent = JSON.stringify(sampleFor(d), null, 2); };
+  det.addEventListener("toggle", () => { if (det.open) render(); });
+  copy.addEventListener("click", async () => {
+    render();
+    try { await navigator.clipboard.writeText(pre.textContent); toast("样例已复制到剪贴板"); }
+    catch { toast("浏览器拒绝了剪贴板权限，请手动选中复制", true); }
+  });
+  fill.addEventListener("click", () => {
+    render();
+    $("#execBox").value = pre.textContent;
+    $("#execBox").focus();
+    toast("已填入执行框，点「发送」即可");
+  });
+
+  root.append(head, now, det);
+  registerCard(d.id, paint);
+  return root;
+}
+
+/* ---------- 渲染 ---------- */
+
+function renderDevices(devices) {
+  const gridSense = $("#gridSense");
+  const gridAct = $("#gridAct");
+  gridSense.innerHTML = "";
+  gridAct.innerHTML = "";
+  cards.clear();
+
+  // 勾选状态：新设备默认不勾选，老设备保留用户选择
+  const alive = new Set(devices.map((d) => d.id));
+  for (const id of [...senseOn.keys()]) if (!alive.has(id)) senseOn.delete(id);
+  for (const d of devices) if (isSense(d) && !senseOn.has(d.id)) senseOn.set(d.id, false);
+
+  const senseList = devices.filter(isSense);
+  const actList = devices.filter(isAct);
+
+  for (const d of senseList) gridSense.appendChild(buildSenseCard(d));
+  for (const d of actList) gridAct.appendChild(buildActCard(d));
+  if (!senseList.length) gridSense.innerHTML = '<div class="empty">网关未上报感知设备</div>';
+  if (!actList.length) gridAct.innerHTML = '<div class="empty">网关未上报执行设备</div>';
+
+  $("#cntSense").textContent = senseList.length;
+  $("#cntAct").textContent = actList.length;
+  $("#overview").textContent = `${devices.filter((d) => d.online).length}/${devices.length} 台在线`;
+  updateWireFilter();
+}
+
+function renderScenes(scenes, active) {
+  const host = $("#scenes");
+  host.innerHTML = "";
+  for (const s of Object.values(scenes || {})) {
+    const b = document.createElement("button");
+    b.className = "btn" + (s.id === active ? " primary" : "");
+    b.dataset.scene = s.id;
+    b.textContent = SCENE_LABEL[s.id] || s.name;
+    b.title = s.hint || "";
+    b.addEventListener("click", () => client.setScene(s.id));
+    host.appendChild(b);
+  }
+}
+
+/* ---------- 消息分发 ---------- */
+
+const client = new TwinClient({
+  onOpen: () => {
+    $("#dot").className = "dot ok";
+    $("#status").textContent = "已连接";
+    $("#connect").textContent = "断开";
+    toast("已接入网关");
+  },
+  onClose: () => {
+    $("#connect").textContent = "连接";
+    if (client._manual) {
+      $("#dot").className = "dot";
+      $("#status").textContent = "已断开";
+      if (client.devices.size) $("#overview").textContent = `${client.devices.size} 台设备 · 已断开，显示最后一次快照`;
+    } else {
+      $("#dot").className = "dot wait";
+      $("#status").textContent = "已断开，自动重连中…";
+    }
+  },
+  onMessage: (msg) => {
+    addWire("in", msg, !wirePass(msg));
+    switch (msg.type) {
+      case "hello":
+        toast(`握手成功 · ${msg.payload?.protocol || ""}`);
+        break;
+      case "snapshot": {
+        const p = msg.payload;
+        renderScenes(p.scenes, p.scene);
+        renderStreams(p.devices);
+        renderDevices(p.devices);
+        const o = p.outdoor || {};
+        const site = p.site?.configured ? ` · ${p.site.name || p.site.lat + "," + p.site.lon}` : "";
+        $("#overview").textContent += ` · 室外 ${(o.temp ?? 0).toFixed(1)}°C${site}`;
+        for (const e of (p.recentEvents || []).slice().reverse()) addEvent(e);
+        break;
+      }
+      case "state": {
+        for (const fn of cards.get(msg.payload.deviceId) || []) fn(msg.payload.state);
+        if (streamState.has(msg.payload.deviceId)) {
+          upsertStream(msg.payload.deviceId, { streaming: !!msg.payload.state?.streaming });
+        }
+        break;
+      }
+      case "video": {
+        // 流信令：只在状态变化时广播，所以不会刷屏
+        const p = msg.payload || {};
+        if (p.deviceId) {
+          upsertStream(p.deviceId, {
+            channel: p.channel,
+            streaming: !!p.streaming,
+            live: !!p.live,
+            viewers: p.viewers ?? 0,
+            fps: p.fps ?? 0,
+          });
+        }
+        break;
+      }
+      case "scene":
+        document.querySelectorAll("#scenes .btn").forEach((b) => {
+          b.classList.toggle("primary", b.dataset.scene === msg.payload.sceneId);
+        });
+        toast(`${msg.payload.name} 已执行`);
+        break;
+      case "event":
+        addEvent(msg.payload);
+        if (msg.payload.level === "alarm") toast("⚠ " + msg.payload.message);
+        break;
+      case "ack":
+        if (msg.payload?.ok === false) toast(`命令被拒绝：${msg.payload.error}`, true);
+        break;
+      case "setup":
+        toast("位置与室外温度已更新");
+        break;
+      case "error":
+        toast(`协议错误：${msg.payload?.message || msg.payload?.code}`, true);
+        break;
+      default:
+        break;
+    }
+  },
+});
+
+/* 让 client 的每个上行报文都进报文面板，并在未连接时给出提示 */
+const rawSend = client._raw.bind(client);
+client._raw = (msg) => {
+  if (!client.connected) { toast("尚未连接：请先点右上角「连接」", true); return false; }
+  const ok = rawSend(msg);
+  if (ok) addWire("out", msg);
+  return ok;
+};
+
+/* ---------- 顶部交互 ---------- */
+
+function defaultServer() {
+  const q = new URLSearchParams(location.search).get("server");
+  if (q) return q;
+  const saved = localStorage.getItem("mshouse.demo.server");
+  if (saved) return saved;
+  return location.protocol.startsWith("http") ? location.origin : "http://localhost:8080";
+}
+
+function doConnect() {
+  const raw = $("#server").value.trim();
+  const url = toWsUrl(raw);
+  if (!url) { toast("服务器地址不合法", true); return; }
+  localStorage.setItem("mshouse.demo.server", raw);
+  $("#status").textContent = "连接中…";
+  $("#dot").className = "dot wait";
+  client.connect(url);
+}
+
+$("#server").value = defaultServer();
+$("#connect").addEventListener("click", () => {
+  if (client.connected) client.disconnect();   // 主动断开，不自动重连
+  else doConnect();
+});
+$("#server").addEventListener("keydown", (e) => { if (e.key === "Enter") doConnect(); });
+$("#ping").addEventListener("click", () => client.ping());
+$("#resync").addEventListener("click", () => client.resync());
+$("#clearEvents").addEventListener("click", () => { $("#events").innerHTML = '<div class="muted">等待事件…</div>'; });
+$("#clearWire").addEventListener("click", () => {
+  wireCount = 0; filteredCount = 0;
+  $("#wireCount").textContent = "0 条";
+  $("#wire").innerHTML = "";
+  updateWireFilter();
+});
+
+/* ---------- 标签页 ---------- */
+
+$("#tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-tab]");
+  if (!b) return;
+  for (const x of $("#tabs").querySelectorAll("button")) x.classList.toggle("active", x === b);
+  const sense = b.dataset.tab === "sense";
+  $("#paneSense").hidden = !sense;
+  $("#paneAct").hidden = sense;
+  $("#devHint").textContent = sense ? SENSE_HINT : ACT_HINT;
+});
+
+function setAllSense(v) {
+  for (const cb of $("#gridSense").querySelectorAll('input[type="checkbox"]')) {
+    if (cb.checked !== v) { cb.checked = v; cb.dispatchEvent(new Event("change")); }
+  }
+}
+$("#senseAll").addEventListener("click", () => setAllSense(true));
+$("#senseNone").addEventListener("click", () => setAllSense(false));
+
+/* ---------- 执行框 ---------- */
+
+function parseReport() {
+  const text = $("#execBox").value.trim();
+  if (!text) { toast("执行框是空的：先粘贴一条报文", true); return null; }
+  let obj;
+  try { obj = JSON.parse(text); }
+  catch (err) { toast(`JSON 解析失败：${err.message}`, true); return null; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) { toast("报文必须是一个 JSON 对象", true); return null; }
+  if (!obj.type) { toast("报文缺少 type 字段（如 command / scene / snapshot）", true); return null; }
+  return obj;
+}
+
+$("#execSend").addEventListener("click", () => {
+  const obj = parseReport();
+  if (!obj) return;
+  if (!client.connected) { toast("尚未连接：请先点右上角「连接」", true); return; }
+  // 补齐信封必需字段，让手写的简写报文也能跑通
+  if (!obj.v) obj.v = PROTOCOL_VERSION;
+  if (!obj.id) obj.id = nextId(obj.type);
+  if (!obj.ts) obj.ts = Date.now();
+  if (!obj.payload || typeof obj.payload !== "object") obj.payload = {};
+  client.sendRaw(obj);
+  toast(`已发送 ${obj.type}`);
+});
+
+$("#execFormat").addEventListener("click", () => {
+  const obj = parseReport();
+  if (obj) { $("#execBox").value = JSON.stringify(obj, null, 2); toast("已格式化"); }
+});
+$("#execClear").addEventListener("click", () => { $("#execBox").value = ""; $("#execBox").focus(); });
+
+/* ---------- 初始状态：默认不连接 ---------- */
+
+$("#devHint").textContent = SENSE_HINT;
+$("#dot").className = "dot";
+$("#status").textContent = "未连接";
+updateWireFilter();
+
+/* 暴露给控制台，方便在浏览器里直接试：
+   client.command("light.living", "set", { power: true, brightness: 60 })
+   client.setScene("away")                                                   */
+window.client = client;
+window.envelope = envelope;
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# MSHouse 镜像家居 · Python 后端依赖（版本 1.0）
+#
+# 安装：
+#   pip install -r requirements.txt
+#
+# 说明：
+#   fastapi + uvicorn   HTTP / WebSocket / 静态资源
+#   numpy + pillow      软光栅渲染与 JPEG 编码（Pillow 的绘制与编码都是 C 实现，
+#                       这是 Python 版性能反超 Node 版的关键）
+#   httpx               调用 Open-Meteo 取天气预报
+#   websockets          协议自检脚本用的 WebSocket 客户端
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+numpy>=1.26
+pillow>=10.0
+httpx>=0.27
+websockets>=12.0
