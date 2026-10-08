@@ -209,12 +209,6 @@ def _route_lock(payload: str) -> dict[str, Any] | None:
     return None
 
 
-def _route_face(payload: str) -> dict[str, Any] | None:
-    if payload.strip().upper() == "PRESS":
-        return {"action": "face", "params": {}}
-    return None
-
-
 def _route_scene(scene_id: str) -> Callable[[str], dict[str, Any] | None]:
     def _r(payload: str) -> dict[str, Any] | None:
         if payload.strip().upper() == "PRESS":
@@ -411,19 +405,6 @@ def build_entities(prefix: str, avail: str) -> list[Entity]:
                     "state_unlocked": "UNLOCKED",
                     "optimistic": False,
                     "icon": "mdi:door-closed-lock",
-                    **base,
-                },
-            ))
-            ents.append(Entity(
-                component="button",
-                object_id=_oid(spec.id, "face"),
-                routes={f"{prefix}/{spec.id}/face/set": _route_face},
-                config={
-                    "name": f"{spec.name} 人脸开锁",
-                    "unique_id": _oid(spec.id, "face"),
-                    "command_topic": f"{prefix}/{spec.id}/face/set",
-                    "payload_press": "PRESS",
-                    "icon": "mdi:face-recognition",
                     **base,
                 },
             ))

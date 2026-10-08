@@ -252,16 +252,9 @@ ws.send(JSON.stringify({ v: "1.0", type: "snapshot", id: "sync-1", ts: Date.now(
 | | `nudge` | `{ delta }` | 相对转动，如 `{ delta: 15 }` / `{ delta: -15 }` |
 | | `arm` | `{ armed }` | 布防开关 |
 | **lock** | `lock` / `unlock` | `{ person? }` | 上锁 / 开锁 |
-| | `face` | `{ faceId }` | 模拟人脸识别，见下 |
 | **sensor** | — | — | **只读**，任何写命令返回 `ok:false` |
 
-**可用的 `faceId`**：
-
-| faceId | 姓名 | 角色 | 结果 |
-|---|---|---|---|
-| `resident.lin` | 林晓 | 住户 | ✅ 通过并自动开锁 |
-| `resident.chen` | 陈舟 | 住户 | ✅ 通过并自动开锁 |
-| `guest.unknown` | 未登记访客 | 访客 | ❌ 拒绝，门保持锁定 |
+人脸识别由摄像头实时画面驱动：识别到已登记人脸自动开锁并广播 `state`（`lastResult:"pass"` + `lastPerson`）；识别到未登记人脸时广播 `faceEnroll` 询问，面板可用 `enrollFace` / `dismissEnroll` 回应。
 
 **常用代码片段**：
 
@@ -275,7 +268,7 @@ cmd("light.bedroom", "set", { power: true, brightness: 8, colorTemp: 2700 });  /
 cmd("ac.living", "set", { power: true, mode: "cool", targetTemp: 25 });       // 客厅制冷 25°C
 cmd("camera.living", "pan", { pan: 180 });                                    // 云台转 180°
 cmd("camera.living", "nudge", { delta: -15 });                                // 向左微调 15°
-cmd("lock.entry", "face", { faceId: "resident.lin" });                        // 刷脸开锁
+cmd("lock.entry", "unlock");                                                  // 远程开锁
 cmd("lock.entry", "lock");                                                    // 远程上锁
 ```
 

@@ -37,7 +37,7 @@ class Channel:
 
     __slots__ = (
         "channel", "name", "osd_name", "device_id", "source", "standby", "context",
-        "live", "viewers", "task", "frames", "started_at", "last_frame",
+        "port", "fps", "live", "viewers", "task", "frames", "started_at", "last_frame",
         "last_tick", "rush",
     )
 
@@ -50,6 +50,10 @@ class Channel:
         self.source = spec["source"]
         self.standby = spec.get("standby")
         self.context: Callable[[], dict[str, Any]] = spec.get("context", lambda: {})
+        # 独立推流端口（0 / None 表示复用主服务端口，画面走 /?stream=<通道>）
+        self.port = int(spec.get("port") or 0)
+        # 该通道推流帧率；0 表示用 StreamHub 的默认帧率（由 define 兜底）
+        self.fps = int(spec.get("fps") or 0)
         self.live = False
         self.viewers: set[asyncio.Queue] = set()
         self.task: asyncio.Task | None = None
@@ -71,7 +75,11 @@ class StreamHub:
 
     def define(self, channel: str, spec: dict[str, Any]) -> None:
         """注册一个通道。通道存在与否和「是否在推流」是两件事。"""
-        self.channels[str(channel)] = Channel(str(channel), spec)
+        ch = Channel(str(channel), spec)
+        # 通道没单独配帧率时回落到 hub 默认帧率
+        if ch.fps <= 0:
+            ch.fps = self.fps
+        self.channels[str(channel)] = ch
 
     def has(self, channel: str) -> bool:
         return str(channel) in self.channels
@@ -95,6 +103,12 @@ class StreamHub:
         ch = self.get(channel)
         return bool(ch and ch.live)
 
+    def kick(self, channel: str) -> None:
+        """画面内容在外部被更换（如上传人脸）时催一帧，观众不用等下一个帧周期。"""
+        ch = self.get(channel)
+        if ch is not None and ch.viewers:
+            ch.rush = True
+
     def info(self, channel: str) -> dict[str, Any] | None:
         """通道描述，进 snapshot / ack 用。"""
         ch = self.get(channel)
@@ -106,7 +120,10 @@ class StreamHub:
             "deviceId": ch.device_id,
             "live": ch.live,
             "viewers": len(ch.viewers),
-            "fps": self.fps if ch.live else self.idle_fps,
+            "fps": ch.fps if ch.live else self.idle_fps,
+            # port 为 null：画面复用主端口，url 是相对地址 /?stream=<通道>；
+            # port 有值：该路在独立端口推流，前端按当前主机名拼 http://主机:port/
+            "port": ch.port or None,
             "url": f"/?stream={ch.channel}",
         }
 
@@ -194,7 +211,7 @@ class StreamHub:
                             q.put_nowait(jpg)
                         except asyncio.QueueFull:
                             pass        # 客户端跟不上，丢这一帧
-                target_fps = self.fps if ch.live else self.idle_fps
+                target_fps = ch.fps if ch.live else self.idle_fps
                 delay = 1.0 / max(1, target_fps) - (time.monotonic() - t0)
                 if ch.rush:
                     ch.rush = False
@@ -206,23 +223,27 @@ class StreamHub:
             ch.task = None
 
     def _render_and_encode(self, ch: Channel) -> bytes | None:
-        """同步渲染 + 编码。由 _run 通过 to_thread 调用（不阻塞事件循环）。"""
+        """同步渲染 + 编码。由 _run 通过 to_thread 调用（不阻塞事件循环）。
+
+        实景源 / 待机源统一为同一个 render 签名（state/env/now/dt/fps/channel/name）。
+        """
+        current_fps = ch.fps if ch.live else self.idle_fps
         now = now_ms()
-        dt = min(0.5, (now - ch.last_tick) / 1000) if ch.last_tick else 1.0 / self.fps
+        dt = min(0.5, (now - ch.last_tick) / 1000) if ch.last_tick else 1.0 / current_fps
         ch.last_tick = now
-        if ch.live:
-            ctx = ch.context() or {}
-            raster = ch.source.render(
-                state=ctx.get("state") or {},
-                env=ctx.get("env") or {},
-                now=now,
-                dt=dt,
-                fps=self.fps,
-            )
-        elif ch.standby is not None:
-            raster = ch.standby.render(now=now, channel=ch.channel, name=ch.osd_name, fps=self.fps)
-        else:
+        source = ch.source if ch.live else ch.standby
+        if source is None:
             return None
+        ctx = ch.context() or {}
+        raster = source.render(
+            state=ctx.get("state") or {},
+            env=ctx.get("env") or {},
+            now=now,
+            dt=dt,
+            fps=current_fps,
+            channel=ch.channel,
+            name=ch.osd_name,
+        )
         if raster is None:
             return None
         return raster.to_jpeg(self.quality)

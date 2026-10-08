@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MSHouse 镜像家居 · 智能家居数字孪生教学</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2b15a'/%3E%3Cpath d='M8 16l8-6 8 6v9H8z' fill='%231b1408'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/css/app.css" />
+  <link rel="stylesheet" href="/css/app.css?v=17" />
 </head>
-<body>
+<body class="panel-hidden">
   <canvas id="viewport"></canvas>
 
   <header class="topbar">
@@ -15,12 +15,13 @@
       <div class="mark">MS</div>
       <div>
         <h1>MSHouse · 镜像家居</h1>
-        <p>Mirror Space · 智能家居教学沙盘 · 物模型 + WebSocket + 流</p>
+        <p>Mirror Space · 智能家居教学沙盘</p>
       </div>
     </div>
     <div class="scenes" id="scenes"></div>
-    <button class="chip" id="setupBtn" type="button">初始化设置</button>
-    <button class="chip on" id="menuToggle" type="button" aria-pressed="true">控制菜单</button>
+    <button class="chip" id="setupBtn" type="button">设置</button>
+    <a class="chip" id="docsBtn" href="/docs.html?v=18" target="_blank" rel="noopener">文档</a>
+    <button class="chip" id="menuToggle" type="button" aria-pressed="false">控制</button>
   </header>
 
   <div class="hud">
@@ -64,20 +65,41 @@
           <img id="lockStream" alt="大门人脸锁视频流" />
         </div>
         <p class="meta" id="lockMeta" style="margin-top:8px">等待流信令…</p>
+        <div class="enroll-banner" id="lockEnrollBanner" hidden>
+          <p class="enroll-title">检测到未登记人脸，是否登记为用户？</p>
+          <p class="meta" id="enrollDist"></p>
+          <div class="row">
+            <input id="enrollName" type="text" maxlength="20" placeholder="用户名称（可留空自动命名）" />
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="mini primary" id="enrollOk" type="button">登记用户</button>
+            <button class="mini" id="enrollSkip" type="button">忽略</button>
+          </div>
+        </div>
         <div class="row" style="margin-top:10px">
           <button class="mini" id="lockOn">推送画面</button>
           <button class="mini" id="lockOff">停止推送</button>
           <button class="mini" id="lockOpen">新窗口打开流</button>
         </div>
         <div class="row" style="margin-top:8px">
-          <button class="mini" id="faceResident">模拟住户人脸</button>
-          <button class="mini" id="faceGuest">模拟访客</button>
-          <button class="mini" id="lockNow">上锁</button>
+          <button class="mini" id="unlockNow">手动开锁</button>
+          <button class="mini" id="lockNow">手动上锁</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="mini" id="faceUpload">上传人脸画面</button>
+          <button class="mini" id="faceClear">恢复门外画面</button>
+          <input type="file" id="faceFile" accept="image/*" hidden />
         </div>
       </div>
       <p class="meta" style="margin:10px 4px 0;line-height:1.6">
         画面走独立 HTTP 流，不占用 WebSocket：
         <code>GET /?stream=233666</code> 返回 MJPEG，浏览器 <code>&lt;img&gt;</code> 直接能播。
+        大门锁默认 2fps，画面随当地天气与日落自动切换（晴/雨/雪/雾/夜）；
+        上传人脸或摄像头实时帧经内置人脸量化模型比对登记库（<code>camera/face.jpg</code>
+        与运行时登记用户），距离 ≤ 阈值即自动开锁；推送中检测到未登记人脸会提示是否登记为新用户，
+        也可用按钮手动开锁 / 上锁。
+        帧率、天气画面、视频源（本机摄像头 / RTSP 流）、人脸阈值都在
+        <code>config.toml</code> 的 <code>[streams.lock_entry]</code> 里配置。
       </p>
     </section>
     <section class="pane" id="pane-wire">
@@ -105,35 +127,89 @@
   </div>
   <div class="toast" id="toast"></div>
 
+  <!-- 每次打开首页：先提示欢迎回家，再自动切换到回家模式 -->
+  <div class="welcome" id="welcomeHome" aria-live="polite">
+    <div class="welcome-card">
+      <div class="welcome-emoji">🏠</div>
+      <div class="welcome-title">欢迎回家</div>
+      <div class="welcome-sub">正在为你切换到回家模式…</div>
+    </div>
+  </div>
+
   <dialog class="setup" id="setupDialog">
-    <form method="dialog" id="setupForm">
-      <header>
-        <h2>初始化设置</h2>
-        <p>写入别墅物理位置，并用该地天气预报初始化室外温度。</p>
-      </header>
-      <label>口令
-        <input id="setupPassword" type="password" name="password" autocomplete="current-password" required placeholder="教学口令 villa" />
-      </label>
-      <label>地点名称
-        <input id="setupName" name="name" maxlength="40" placeholder="例如 杭州 · 西湖" />
-      </label>
-      <div class="pair">
-        <label>纬度
-          <input id="setupLat" name="lat" type="number" step="0.0001" min="-90" max="90" required placeholder="30.2741" />
+    <form id="setupForm">
+      <!-- 第一步：口令校验 -->
+      <div id="setupAuthPane">
+        <header>
+          <h2>设置</h2>
+          <p>请先输入教学口令，验证通过后才能查看与修改设置。</p>
+        </header>
+        <label>口令
+          <input id="setupPassword" type="password" name="password" autocomplete="current-password" placeholder="教学口令 villa" />
         </label>
-        <label>经度
-          <input id="setupLon" name="lon" type="number" step="0.0001" min="-180" max="180" required placeholder="120.1551" />
-        </label>
+        <p class="setup-error" id="setupAuthError" hidden></p>
+        <footer>
+          <button class="mini" type="button" id="setupCancel">取消</button>
+          <button class="primary" type="button" id="setupAuthBtn">下一步</button>
+        </footer>
       </div>
-      <div class="row">
-        <button class="mini" type="button" id="setupGeo">使用当前位置</button>
-        <span class="meta" id="setupHint">口令校验在网关侧完成，通过后拉取公开预报。</span>
+
+      <!-- 第二步：分项卡片（各项均可留空） -->
+      <div id="setupCardsPane" hidden>
+        <header>
+          <h2>设置</h2>
+          <p>口令已通过。各项均可留空：留空的项保持现有设置不变。</p>
+        </header>
+
+        <section class="setup-card">
+          <h3>住宅位置</h3>
+          <label>地点名称
+            <input id="setupName" name="name" maxlength="40" placeholder="默认：浙江温州" />
+          </label>
+          <label>详细地址
+            <input id="setupAddress" name="address" maxlength="120"
+                   placeholder="浙江省温州市瓯海区郭溪街道科高路 1 号（温州科技高级中学）" />
+          </label>
+          <div class="pair">
+            <label>纬度
+              <input id="setupLat" name="lat" type="number" step="0.0001" min="-90" max="90" placeholder="27.9925" />
+            </label>
+            <label>经度
+              <input id="setupLon" name="lon" type="number" step="0.0001" min="-180" max="180" placeholder="120.5801" />
+            </label>
+          </div>
+          <div class="row">
+            <button class="mini" type="button" id="setupGeo">使用当前位置</button>
+            <span class="meta" id="setupHint">经纬度留空则不重新定位；填写后按当地预报初始化室外温度与日照。</span>
+          </div>
+        </section>
+
+        <section class="setup-card">
+          <h3>大门锁画面来源</h3>
+          <label>画面来源
+            <select id="setupLockKind">
+              <option value="image">静态画面（按天气自动切换）</option>
+              <option value="camera">本机摄像头</option>
+              <option value="stream">网络视频流（RTSP / HTTP-MJPEG）</option>
+            </select>
+          </label>
+          <label id="setupLockIndexWrap" hidden>摄像头序号
+            <input id="setupLockIndex" type="number" min="0" max="15" step="1" value="0" />
+          </label>
+          <label id="setupLockUrlWrap" hidden>视频流地址
+            <input id="setupLockUrl" type="text" maxlength="300"
+                   placeholder="rtsp://user:pass@192.168.1.10:554/stream1" />
+          </label>
+          <p class="meta" id="setupSourceHint">画面来源切换后立即生效并记忆，重启服务也会保留。</p>
+        </section>
+
+        <p class="setup-error" id="setupError" hidden></p>
+        <footer>
+          <button class="mini" type="button" id="setupBack">返回口令</button>
+          <button class="mini" type="button" id="setupCancel2">取消</button>
+          <button class="primary" type="submit" id="setupSubmit">保存设置</button>
+        </footer>
       </div>
-      <p class="setup-error" id="setupError" hidden></p>
-      <footer>
-        <button class="mini" type="button" id="setupCancel">取消</button>
-        <button class="primary" type="submit" id="setupSubmit">写入并初始化</button>
-      </footer>
     </form>
   </dialog>
 
@@ -145,6 +221,6 @@
       }
     }
   </script>
-  <script type="module" src="/js/main.js"></script>
+  <script type="module" src="/js/main.js?v=17"></script>
 </body>
 </html>

@@ -6,18 +6,24 @@
  * 视频：WebSocket 只承载「流信令」（通道名 / 是否在推 / 云台角），
  *       像素由 /?stream=<通道> 这个 HTTP 长连接提供，两条通道互不干扰。
  */
-import { envelope, nextId } from "./protocol.js";
-import { MSHouseScene } from "./scene.js";
-import { Dashboard } from "./ui.js";
+import { envelope, nextId } from "./protocol.js?v=17";
+import { MSHouseScene } from "./scene.js?v=17";
+import { Dashboard } from "./ui.js?v=17";
 
 const OCCUPANCY = { home: "在家", away: "离家", sleep: "睡眠" };
 
 const state = {
   devices: new Map(),
-  scene: "away",
-  occupancy: "away",
+  scene: "home",
+  occupancy: "home",
   streams: new Map(),
 };
+
+// 每次「打开首页」（整页加载）只欢迎一次；WebSocket 断线重连不再重复提示
+let homeWelcomed = false;
+
+// 等待口令校验 ack 的消息 id 集合
+const pendingAuthAcks = new Set();
 
 /* ---------------- 三维 + 界面 ---------------- */
 /**
@@ -54,6 +60,13 @@ const ui = new Dashboard({
   floor: (mode) => scene.setFloor(mode),
   roof: (on) => scene.setRoof(on),
   setup: (payload) => send(envelope("setup", payload)),
+  setupAuth: (password) => {
+    const id = nextId("auth");
+    pendingAuthAcks.add(id);
+    send(envelope("setupAuth", { password }, { id }));
+  },
+  uploadFace: (file) => uploadFace(file),
+  clearFace: () => clearFace(),
 });
 
 scene.onSelect((id) => {
@@ -129,19 +142,35 @@ function handle(msg) {
     case "video":
       applyVideoSignal(msg.payload);
       break;
+    case "faceEnroll": {
+      const p = msg.payload || {};
+      if (p.status === "ask") ui.showEnrollPrompt(p);
+      else ui.hideEnrollPrompt(p);
+      break;
+    }
     case "setup":
       ui.setSite(msg.payload?.site);
+      scene.setSiteName?.(msg.payload?.site?.name);
       if (msg.payload?.outdoor) {
         const o = msg.payload.outdoor;
         ui.setOutdoor(`${o.temp.toFixed(1)}°C / ${Math.round(o.humidity)}%`);
       }
       ui.setSetupBusy(false);
-      ui.closeSetup();
-      ui.toast("位置与室外温度已按预报初始化");
+        ui.closeSetup();
+        ui.toast("设置已保存");
       break;
     case "ack":
-      if (msg.payload && msg.payload.ok === false && /口令|经纬|天气|预报/.test(msg.payload.error || "")) {
-        ui.setSetupBusy(false, msg.payload.error);
+      if (pendingAuthAcks.has(msg.id)) {
+        pendingAuthAcks.delete(msg.id);
+        ui.setupAuthResult(msg.payload?.ok !== false, msg.payload?.error);
+        break;
+      }
+      if (msg.payload && msg.payload.ok === false) {
+        if (/口令|经纬|天气|预报|来源|流地址|摄像头序号|留空/.test(msg.payload.error || "")) {
+          ui.setSetupBusy(false, msg.payload.error);
+        } else if (msg.payload.action === "enrollFace") {
+          ui.enrollFailed(msg.payload.error);
+        }
       }
       break;
     case "error":
@@ -164,6 +193,9 @@ function applySnapshot(snap) {
   ui.setOccupancy(OCCUPANCY[snap.occupancy] || snap.occupancy);
   ui.setOutdoor(`${snap.outdoor.temp.toFixed(1)}°C / ${Math.round(snap.outdoor.humidity)}%`);
   ui.setSite(snap.site);
+  ui.setLockSource(snap.lock?.source);
+  if (snap.lock?.enroll) ui.showEnrollPrompt(snap.lock.enroll);
+  else ui.hideEnrollPrompt(null);
   ui.setOnline(`${snap.devices.filter((d) => d.online).length}/${snap.devices.length}`);
   for (const e of (snap.recentEvents || []).slice().reverse()) ui.addEvent(e);
   // 设备影子自带通道信息，首屏就能把画面面板接上流
@@ -171,6 +203,13 @@ function applySnapshot(snap) {
 
   scene.applySnapshot(snap);
   scene.select(null);
+
+  // 每一次访问首页：先提示「欢迎回家」，再切换到回家模式
+  if (!homeWelcomed) {
+    homeWelcomed = true;
+    ui.welcomeHome();
+    setTimeout(() => send(envelope("scene", { sceneId: "home" })), 650);
+  }
 }
 
 function applyDeviceState(payload) {
@@ -188,9 +227,10 @@ function applyDeviceState(payload) {
  */
 function applyVideoSignal(p) {
   if (!p?.channel) return;
-  state.streams.set(p.deviceId, { channel: p.channel, live: !!p.live });
+  state.streams.set(p.deviceId, { channel: p.channel, live: !!p.live, port: p.port || null });
   ui.setStream(p.deviceId, {
     channel: p.channel,
+    port: p.port || null,
     live: !!p.live,
     fps: p.live ? (p.fps ?? 8) : (p.idleFps ?? 2),
   });
@@ -206,7 +246,68 @@ function applyVideoSignal(p) {
     ].join(" · "));
   } else if (p.kind === "lock") {
     const r = p.result === "pass" ? "识别通过" : p.result === "reject" ? "识别拒绝" : p.locked ? "已上锁" : "已开锁";
-    ui.setVideoMeta("lock.entry", [r, p.person || null, p.live ? "推流中" : "待机", `通道 ${p.channel}`].filter(Boolean).join(" · "));
+    const srcDesc = p.source
+      ? (p.source.kind === "camera" ? `本机摄像头 #${p.source.target?.split("#")[1] || p.source.target || ""}`
+        : p.source.kind === "stream" ? "网络视频流"
+        : "静态画面")
+      : null;
+    const srcState = p.source && p.source.kind !== "image"
+      ? (p.source.opened ? "" : `（${p.live ? "连接失败" : "未连接"}）`)
+      : "";
+    const phaseMap = { DAWN: "黎明", DAY: "白天", DUSK: "黄昏", NIGHT: "夜间" };
+    ui.setVideoMeta("lock.entry", [
+      r,
+      p.person || null,
+      phaseMap[p.phase] || null,
+      p.facePresent ? "人脸画面" : "门外画面",
+      srcDesc ? `来源：${srcDesc}${srcState}` : null,
+      p.live ? "推流中" : "待机",
+      `通道 ${p.channel}`,
+      p.port ? `推流端口 ${p.port}` : null,
+    ].filter(Boolean).join(" · "));
+  }
+}
+
+/* ---------------- 大门锁：上传 / 移除人脸画面 ---------------- */
+async function uploadFace(file) {
+  ui.setVideoMeta("lock.entry", `正在上传「${file.name}」…`);
+  try {
+    const res = await fetch("/api/lock/face", {
+      method: "POST",
+      headers: { "Content-Type": file.type || "image/jpeg" },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      ui.toast("人脸画面上传失败：" + (data.error || res.status));
+      return;
+    }
+    // 内置模型的比对结果：matched + 距离/阈值；状态行随后续 video 信令自动刷新
+    if (data.recognitionReady === false) {
+      ui.toast("画面已上传，但识别模型未就绪：" + (data.reason || ""));
+    } else if (data.matched) {
+      ui.toast(`识别通过：距离 ${data.distance} ≤ 阈值 ${data.threshold}，门锁已打开`);
+    } else if (data.distance != null) {
+      ui.toast(`识别拒绝：距离 ${data.distance} > 阈值 ${data.threshold}，大门保持锁定`);
+    } else {
+      ui.toast("画面已上传，但没有检测到正脸");
+    }
+  } catch (err) {
+    ui.toast("人脸画面上传失败：" + err.message);
+  }
+}
+
+async function clearFace() {
+  try {
+    const res = await fetch("/api/lock/face", { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      ui.toast("恢复门外画面失败：" + (data.error || res.status));
+      return;
+    }
+    ui.toast("已恢复门外草坪道路画面");
+  } catch (err) {
+    ui.toast("恢复门外画面失败：" + err.message);
   }
 }
 

@@ -13,6 +13,16 @@ function el(tag, className, text) {
   return n;
 }
 
+/**
+ * 拼一路视频流的地址：
+ *   配置了独立推流端口 → http://当前主机:端口/（和真实 IP 摄像头一致）；
+ *   否则复用主端口     → /?stream=<通道号>（相对地址，跟页面同源）。
+ */
+export function streamSrc(info) {
+  if (info?.port) return `http://${location.hostname}:${info.port}/`;
+  return `/?stream=${info.channel}`;
+}
+
 const TYPE_LABEL = { light: "灯光", sensor: "传感器", ac: "空调", camera: "摄像头", lock: "门锁" };
 const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bath: "卫生间", entry: "门厅" };
 const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
@@ -26,6 +36,9 @@ export class Dashboard {
     this.wireCount = 0;
     this.deviceIndex = new Map();
     this._wireTimer = null;
+    this._videoReady = false;       // 「画面」标签是否已首次打开（懒挂载 MJPEG）
+    this.lockSource = null;         // 大门锁当前画面来源（快照下发，用于初始化弹窗预填）
+    this.enrollToken = null;        // 未登记人脸登记询问的当前令牌
     this._bindChrome();
   }
 
@@ -35,6 +48,17 @@ export class Dashboard {
       btn.addEventListener("click", () => {
         document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b === btn));
         document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.id === `pane-${btn.dataset.pane}`));
+        // MJPEG 是一条永不结束的 HTTP 长连接：在面板 display:none 时挂流，
+        // 部分浏览器会暂缓首帧解码；更不能反复 remove/重挂 src（会 abort 连接
+        // 造成重连风暴）。所以画面采用懒挂载：第一次打开「画面」标签才挂流，
+        // 之后一直保持，切走再切回也不动它（新窗口打开本来就不受影响）。
+        if (btn.dataset.pane === "video" && !this._videoReady) {
+          this._videoReady = true;
+          for (const id of ["camStream", "lockStream"]) {
+            const img = document.getElementById(id);
+            if (img?.dataset.src) img.setAttribute("src", img.dataset.src);
+          }
+        }
       });
     }
     const floors = { floorAll: "all", floor1: "1", floor2: "2" };
@@ -57,27 +81,58 @@ export class Dashboard {
 
     document.getElementById("clearWire")?.addEventListener("click", () => this.clearWire());
     document.getElementById("pingBtn")?.addEventListener("click", () => this.h.ping?.());
-    document.getElementById("faceResident")?.addEventListener("click", () => this.h.send?.({
-      type: "command", payload: { deviceId: "lock.entry", action: "face", params: { faceId: "resident.lin" } },
-    }));
-    document.getElementById("faceGuest")?.addEventListener("click", () => this.h.send?.({
-      type: "command", payload: { deviceId: "lock.entry", action: "face", params: { faceId: "guest.unknown" } },
-    }));
     document.getElementById("lockNow")?.addEventListener("click", () => this.h.send?.({
       type: "command", payload: { deviceId: "lock.entry", action: "lock", params: {} },
     }));
+    document.getElementById("unlockNow")?.addEventListener("click", () => this.h.send?.({
+      type: "command", payload: { deviceId: "lock.entry", action: "unlock", params: {} },
+    }));
+    document.getElementById("enrollOk")?.addEventListener("click", () => {
+      const token = this.enrollToken;
+      if (!token) return;
+      const name = $("#enrollName")?.value?.trim() || "";
+      $("#enrollOk").disabled = true;
+      this.h.send?.({
+        type: "command",
+        payload: { deviceId: "lock.entry", action: "enrollFace", params: { token, name } },
+      });
+    });
+    document.getElementById("enrollSkip")?.addEventListener("click", () => {
+      const token = this.enrollToken;
+      if (!token) return;
+      this.h.send?.({
+        type: "command",
+        payload: { deviceId: "lock.entry", action: "dismissEnroll", params: { token } },
+      });
+    });
+
+    // 上传人脸画面：把图片二进制 POST 给网关，画面从门外草坪道路切到上传的人脸
+    const faceFile = document.getElementById("faceFile");
+    document.getElementById("faceUpload")?.addEventListener("click", () => faceFile?.click());
+    faceFile?.addEventListener("change", () => {
+      const file = faceFile.files?.[0];
+      if (file) this.h.uploadFace?.(file);
+      faceFile.value = "";
+    });
+    document.getElementById("faceClear")?.addEventListener("click", () => this.h.clearFace?.());
 
     const menu = document.getElementById("menuToggle");
-    const saved = localStorage.getItem("mshouse.panel") === "hidden";
-    this.setPanelHidden(saved);
+    // 默认隐藏控制面板；只有用户上次明确选择“显示”时才保持展开
+    const saved = localStorage.getItem("mshouse.panel");
+    this.setPanelHidden(saved !== "shown");
     menu?.addEventListener("click", () => this.setPanelHidden(!document.body.classList.contains("panel-hidden")));
 
     document.getElementById("setupBtn")?.addEventListener("click", () => this.openSetup());
     document.getElementById("setupCancel")?.addEventListener("click", () => this.closeSetup());
+    document.getElementById("setupCancel2")?.addEventListener("click", () => this.closeSetup());
+    document.getElementById("setupBack")?.addEventListener("click", () => this._showAuthPane());
     document.getElementById("setupGeo")?.addEventListener("click", () => this._fillGeo());
+    document.getElementById("setupLockKind")?.addEventListener("change", () => this._syncLockSourceFields());
     document.getElementById("setupForm")?.addEventListener("submit", (e) => {
       e.preventDefault();
-      this._submitSetup();
+      // 同一个 form：口令页回车/点「下一步」走校验，卡片页点「保存设置」走提交
+      if ($("#setupCardsPane")?.hidden) this._verifyPassword();
+      else this._submitSetup();
     });
 
     // 画面面板：流控制按钮只发一条 command，地址由流信令带回来（见 setStream）
@@ -90,7 +145,8 @@ export class Dashboard {
     document.getElementById("lockOff")?.addEventListener("click", () => streamCmd("lock.entry", false));
     for (const [btnId, imgId] of [["camOpen", "camStream"], ["lockOpen", "lockStream"]]) {
       document.getElementById(btnId)?.addEventListener("click", () => {
-        const src = document.getElementById(imgId)?.getAttribute("src");
+        const img = document.getElementById(imgId);
+        const src = img?.dataset.src || img?.getAttribute("src");
         if (src) window.open(src, "_blank");
       });
     }
@@ -129,16 +185,17 @@ export class Dashboard {
   setOnline(text) { const n = $("#onlineCount"); if (n) n.textContent = text; }
 
   setSite(site) {
+    this.site = site || null;
     const btn = $("#setupBtn");
     if (!btn) return;
+    // 按钮名称固定为「设置」，用高亮与悬停提示表达配置状态
+    btn.textContent = "设置";
     if (site?.configured) {
       btn.classList.add("on");
-      btn.textContent = site.name || `${site.lat}, ${site.lon}`;
-      btn.title = `已定位 ${site.lat}, ${site.lon}`;
+      btn.title = `${site.name || ""}${site.address ? "\n" + site.address : ""}\n${site.lat}, ${site.lon}`;
     } else {
       btn.classList.remove("on");
-      btn.textContent = "初始化设置";
-      btn.title = "尚未写入物理位置";
+      btn.title = site?.name ? `当前默认：${site.name}（尚未写入定位）` : "尚未写入物理位置";
     }
   }
 
@@ -148,23 +205,70 @@ export class Dashboard {
     if (btn) {
       btn.classList.toggle("on", !hidden);
       btn.setAttribute("aria-pressed", hidden ? "false" : "true");
-      btn.textContent = hidden ? "显示菜单" : "控制菜单";
+      btn.textContent = hidden ? "控制" : "隐藏";
     }
     try { localStorage.setItem("mshouse.panel", hidden ? "hidden" : "shown"); } catch { /* 忽略隐私模式 */ }
     requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
   }
 
-  openSetup(prefill = {}) {
+  openSetup() {
     const dlg = $("#setupDialog");
     if (!dlg) return;
-    const err = $("#setupError");
-    if (err) { err.hidden = true; err.textContent = ""; }
-    if (prefill.name != null) $("#setupName").value = prefill.name;
-    if (prefill.lat != null) $("#setupLat").value = prefill.lat;
-    if (prefill.lon != null) $("#setupLon").value = prefill.lon;
+    this._setupVerified = false;
+    this._setupPassword = "";
     $("#setupPassword").value = "";
+    this._setError("#setupAuthError", null);
+    this._setError("#setupError", null);
+    this.setAuthBusy(false);
+    this.setSetupBusy(false);
+    this._showAuthPane();
     if (typeof dlg.showModal === "function") dlg.showModal();
     else dlg.setAttribute("open", "");
+  }
+
+  _showAuthPane() {
+    const auth = $("#setupAuthPane");
+    const cards = $("#setupCardsPane");
+    if (auth) auth.hidden = false;
+    if (cards) cards.hidden = true;
+    $("#setupPassword")?.focus();
+  }
+
+  _showCardsPane() {
+    const auth = $("#setupAuthPane");
+    const cards = $("#setupCardsPane");
+    if (auth) auth.hidden = true;
+    if (cards) cards.hidden = false;
+    this._prefillSetupCards();
+  }
+
+  /** 口令通过后用最新快照预填卡片（未配置时网关下发温州默认值） */
+  _prefillSetupCards() {
+    const s = this.site || {};
+    $("#setupName").value = s.name || "";
+    $("#setupAddress").value = s.address || "";
+    $("#setupLat").value = s.lat ?? "";
+    $("#setupLon").value = s.lon ?? "";
+    const src = this.lockSource || { kind: "image", index: 0, url: "" };
+    const kindSel = $("#setupLockKind");
+    if (kindSel) kindSel.value = src.kind || "image";
+    const idx = $("#setupLockIndex");
+    if (idx) idx.value = String(src.index ?? 0);
+    const url = $("#setupLockUrl");
+    if (url) url.value = src.url || "";
+    this._syncLockSourceFields();
+  }
+
+  setLockSource(source) {
+    this.lockSource = source || null;
+  }
+
+  _syncLockSourceFields() {
+    const kind = $("#setupLockKind")?.value || "image";
+    const idxWrap = $("#setupLockIndexWrap");
+    const urlWrap = $("#setupLockUrlWrap");
+    if (idxWrap) idxWrap.hidden = kind !== "camera";
+    if (urlWrap) urlWrap.hidden = kind !== "stream";
   }
 
   closeSetup() {
@@ -173,16 +277,49 @@ export class Dashboard {
     dlg?.removeAttribute("open");
   }
 
+  _setError(selector, error) {
+    const err = $(selector);
+    if (!err) return;
+    err.hidden = !error;
+    err.textContent = error || "";
+  }
+
+  setAuthBusy(busy, error) {
+    const btn = $("#setupAuthBtn");
+    if (btn) {
+      btn.disabled = busy;
+      btn.textContent = busy ? "正在校验…" : "下一步";
+    }
+    if (error !== undefined) this._setError("#setupAuthError", error);
+  }
+
   setSetupBusy(busy, error) {
     const btn = $("#setupSubmit");
     if (btn) {
       btn.disabled = busy;
-      btn.textContent = busy ? "正在拉取预报…" : "写入并初始化";
+      btn.textContent = busy ? "正在保存…" : "保存设置";
     }
-    const err = $("#setupError");
-    if (!err) return;
-    err.hidden = !error;
-    err.textContent = error || "";
+    if (error !== undefined) this._setError("#setupError", error);
+  }
+
+  /** setupAuth 的 ack 回来后由 main.js 回调 */
+  setupAuthResult(ok, error) {
+    if (ok) {
+      this._setupVerified = true;
+      this._setupPassword = $("#setupPassword")?.value || "";
+      this._setError("#setupAuthError", null);
+      this.setAuthBusy(false);
+      this._showCardsPane();
+    } else {
+      this.setAuthBusy(false, error || "口令校验失败");
+    }
+  }
+
+  _verifyPassword() {
+    const password = $("#setupPassword")?.value || "";
+    if (!password) { this.setAuthBusy(false, "请输入初始化口令"); return; }
+    this.setAuthBusy(true);
+    this.h.setupAuth?.(password);
   }
 
   _fillGeo() {
@@ -195,21 +332,37 @@ export class Dashboard {
     navigator.geolocation.getCurrentPosition((pos) => {
       $("#setupLat").value = pos.coords.latitude.toFixed(4);
       $("#setupLon").value = pos.coords.longitude.toFixed(4);
-      if (hint) hint.textContent = "已填入当前位置，确认口令后写入。";
+      if (hint) hint.textContent = "已填入当前位置，保存后写入。";
     }, () => {
       if (hint) hint.textContent = "定位被拒绝，请手填经纬度。";
     }, { enableHighAccuracy: false, timeout: 8000 });
   }
 
   _submitSetup() {
-    const password = $("#setupPassword")?.value || "";
-    const lat = Number($("#setupLat")?.value);
-    const lon = Number($("#setupLon")?.value);
+    if (!this._setupVerified) { this._showAuthPane(); return; }
+    // 经纬度整体可留空；只填一个要求补齐
+    const latRaw = $("#setupLat")?.value?.trim() ?? "";
+    const lonRaw = $("#setupLon")?.value?.trim() ?? "";
+    if (!latRaw !== !lonRaw) { this.setSetupBusy(false, "经纬度需同时填写，或同时留空"); return; }
+    let lat = null, lon = null;
+    if (latRaw) {
+      lat = Number(latRaw); lon = Number(lonRaw);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) { this.setSetupBusy(false, "请填写合法经纬度"); return; }
+    }
     const name = $("#setupName")?.value?.trim() || "";
-    if (!password) { this.setSetupBusy(false, "请输入初始化口令"); return; }
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) { this.setSetupBusy(false, "请填写合法经纬度"); return; }
+    const address = $("#setupAddress")?.value?.trim() || "";
+    const kind = $("#setupLockKind")?.value || "image";
+    const index = Math.max(0, Math.min(15, Number($("#setupLockIndex")?.value) || 0));
+    const url = $("#setupLockUrl")?.value?.trim() || "";
+    if (kind === "stream" && !url) { this.setSetupBusy(false, "选择网络视频流时必须填写流地址"); return; }
     this.setSetupBusy(true);
-    this.h.setup?.({ password, lat, lon, name });
+    const payload = {
+      password: this._setupPassword,
+      name, address,
+      lockSource: { kind, index, url },
+    };
+    if (lat != null) { payload.lat = lat; payload.lon = lon; }
+    this.h.setup?.(payload);
   }
 
   toast(text) {
@@ -219,6 +372,15 @@ export class Dashboard {
     t.classList.add("show");
     clearTimeout(this._toastTimer);
     this._toastTimer = setTimeout(() => t.classList.remove("show"), 1900);
+  }
+
+  /** 每次访问首页的「欢迎回家」浮层，约 2.6 秒后自动淡出 */
+  welcomeHome() {
+    const w = $("#welcomeHome");
+    if (!w) return;
+    w.classList.add("show");
+    clearTimeout(this._welcomeTimer);
+    this._welcomeTimer = setTimeout(() => w.classList.remove("show"), 2600);
   }
 
   /* ---------------- 设备控制卡 ---------------- */
@@ -439,10 +601,8 @@ export class Dashboard {
       unlock.addEventListener("click", () => send("unlock", {}));
       const lockBtn = el("button", null, "上锁");
       lockBtn.addEventListener("click", () => send("lock", {}));
-      const scan = el("button", "mini", "模拟人脸识别");
-      scan.addEventListener("click", () => send("face", { faceId: "resident.lin" }));
       const row = el("div", "row");
-      row.append(unlock, lockBtn, scan);
+      row.append(unlock, lockBtn);
       ctrl.appendChild(row);
       const meta = el("p", "meta", "—");
       ctrl.appendChild(meta);
@@ -539,6 +699,7 @@ export class Dashboard {
   }
 
   /* ---------------- 画面（HTTP 流） ---------------- */
+
   /**
    * 流信令到达时更新画面面板。
    * 画面本身不经过 WebSocket：这里只是把 /?stream=<通道> 交给 <img>，
@@ -547,9 +708,14 @@ export class Dashboard {
   setStream(deviceId, info) {
     const key = deviceId === "camera.living" ? "cam" : deviceId === "lock.entry" ? "lock" : null;
     if (!key || !info?.channel) return;
-    const src = `/?stream=${info.channel}`;
+    const src = streamSrc(info);
     const img = $(`#${key}Stream`);
-    if (img && img.getAttribute("src") !== src) img.setAttribute("src", src);
+    if (img) {
+      img.dataset.src = src;
+      // 面板还没首次打开时只记下地址，不建立 MJPEG 连接；
+      // 已打开后，地址没变就绝不重挂（重挂会 abort 正在播放的长连接）。
+      if (this._videoReady && img.getAttribute("src") !== src) img.setAttribute("src", src);
+    }
 
     const tag = img?.parentElement?.querySelector(".tag");
     if (tag) tag.textContent = `CH ${info.channel}`;
@@ -568,5 +734,52 @@ export class Dashboard {
   setVideoMeta(deviceId, text) {
     const node = deviceId === "camera.living" ? $("#camMeta") : $("#lockMeta");
     if (node) node.textContent = text;
+  }
+
+  /* ---------------- 大门锁：未登记人脸登记询问 ---------------- */
+
+  /** 网关询问「是否登记用户」（或快照里带着待确认询问） */
+  showEnrollPrompt(p) {
+    if (!p || !p.token) return;
+    // 旧询问未关闭又来新询问时，替换为新的
+    this.enrollToken = p.token;
+    const banner = $("#lockEnrollBanner");
+    const dist = $("#enrollDist");
+    if (dist) {
+      dist.textContent = (p.distance != null && p.threshold != null)
+        ? `人脸最近距离 ${p.distance} > 阈值 ${p.threshold}，不在当前登记库中。`
+        : "该人脸不在当前登记库中。";
+    }
+    const okBtn = $("#enrollOk");
+    if (okBtn) okBtn.disabled = false;
+    banner?.removeAttribute("hidden");
+  }
+
+  /** 登记请求被网关拒绝（如提示过期）：保留横幅、恢复按钮、提示原因 */
+  enrollFailed(error) {
+    const okBtn = $("#enrollOk");
+    if (okBtn) okBtn.disabled = false;
+    this.toast(error || "登记失败");
+  }
+
+  /** 询问结束：enrolled=已登记 / dismissed=已忽略 / gone=人已离开 / canceled|expired=撤销 */
+  hideEnrollPrompt(p) {
+    if (p?.token && this.enrollToken && p.token !== this.enrollToken) return;
+    this.enrollToken = null;
+    const banner = $("#lockEnrollBanner");
+    banner?.setAttribute("hidden", "");
+    const nameInput = $("#enrollName");
+    if (nameInput) nameInput.value = "";
+    const okBtn = $("#enrollOk");
+    if (okBtn) okBtn.disabled = false;
+    const map = {
+      enrolled: `已登记新用户${p?.name ? `「${p.name}」` : ""}，下次刷脸即可自动开锁`,
+      dismissed: "已忽略，本次人脸停留期间不再提示",
+      gone: "人脸已离开画面",
+      expired: "登记提示已过期",
+      canceled: null,
+    };
+    const text = p ? map[p.status] : null;
+    if (text) this.toast(text);
   }
 }

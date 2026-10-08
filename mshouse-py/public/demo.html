@@ -743,7 +743,7 @@ function sampleFor(d) {
       // 样例给的是流指令：与上方「视频流」卡片的按钮等价，便于对照
       return s.streaming ? cmd("stream", { on: false }) : cmd("stream", { on: true });
     case "lock":
-      return cmd("face", { faceId: "resident.lin" });
+      return s.locked ? cmd("unlock", {}) : cmd("lock", {});
     default:
       return cmd("set", {});
   }

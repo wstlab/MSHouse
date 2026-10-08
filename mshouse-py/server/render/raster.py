@@ -145,6 +145,20 @@ class Raster:
         """把一整张 numpy 图 (h, w, 3) 贴成画布内容。"""
         self._img.paste(Image.fromarray(np.ascontiguousarray(arr, dtype=np.uint8)), (0, 0))
 
+    def color_grade(self, gain: Sequence[float] = (1.0, 1.0, 1.0), add: float = 0.0) -> None:
+        """整图通道调色：out = clip(in * gain + add)。
+
+        用于大门锁按当地日照做光线处理 —— 正午接近原色，晨昏加暖橙，
+        夜间压暗并偏蓝（模拟月光 / 路灯白平衡）。
+        """
+        gain = (float(gain[0]), float(gain[1]), float(gain[2]))
+        if gain == (1.0, 1.0, 1.0) and add == 0.0:
+            return
+        arr = np.asarray(self._img, dtype=np.float32)
+        arr *= np.array(gain, dtype=np.float32)
+        arr += float(add)
+        self.paste_array(np.clip(arr, 0, 255).astype(np.uint8))
+
     # ---------------- 基础绘制 ----------------
 
     @staticmethod

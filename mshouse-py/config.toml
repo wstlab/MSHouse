@@ -1,0 +1,65 @@
+# MSHouse 镜像家居 · 运行配置
+#
+# 修改后需要重启服务生效：
+#     python -m server.main
+# 环境变量 PORT 仍然可用，并优先于这里的 server.port（方便临时换端口）。
+
+[server]
+# 主服务端口：网页、WebSocket(/ws)、健康检查(/health) 默认都在这里
+host = "0.0.0.0"
+port = 8080
+
+# ------------------------------------------------------------------ #
+# 摄像头推流端口配置
+#
+# port = 0   复用主服务端口，画面地址为：
+#                http://主机:主端口/?stream=<通道号>
+# port 设为具体端口（如 8090）后，会为该路画面单独起一个推流服务，
+# 地址与真实 IP 摄像头一致：
+#                http://主机:8090/
+# 端口必须在 1~65535 之间、两两不同，且不能等于 server.port。
+# ------------------------------------------------------------------ #
+
+[streams.camera_living]
+device = "camera.living"      # 物模型里的设备 ID（server/model.py）
+channel = "233666"            # 视频通道号
+port = 0                      # 0 = 复用主服务端口；改成 8090 即独立推流端口
+fps = 5                       # 推送画面时的帧率（帧/秒，范围 1~30）
+
+[streams.lock_entry]
+device = "lock.entry"
+channel = "233667"
+port = 0                      # 0 = 复用主端口；改成 8091 即独立推流端口
+fps = 2                       # 大门锁默认 2 帧/秒（允许 1~30，可后期调整）
+# 默认画面（相对项目根目录）：大门外的草坪与道路；上传人脸后画面会切到人脸
+# 停止推送后，大门锁与摄像头一样回到 STANDBY 无画面提示
+# 同时它也是「天气场景图缺失」和「视频源未连上」时的兜底画面
+image = "camera/lock.jpg"
+
+# —— 随当地天气自动切换的画面（文件不存在时自动回落到上面的 image）——
+# 注意：昼夜不再换图 —— 画面会按当地日出日落做光线处理（黎明暖橙 / 正午自然 /
+# 黄昏暖橙 / 入夜压暗偏蓝），同一张晴天图在夜里就是月夜效果。
+[streams.lock_entry.scenes]
+sunny    = "camera/sunny.jpg"   # 晴 / 大部晴朗
+cloudy   = "camera/lock.jpg"    # 多云：暂无专属素材，用默认门廊图
+overcast = "camera/lock.jpg"    # 阴
+fog      = "camera/fog.jpg"     # 雾 / 雾凇
+rain     = "camera/rain.jpg"    # 雨 / 阵雨 / 雷暴
+snow     = "camera/snow.jpg"    # 雪 / 阵雪
+
+# —— 画面来源（启动默认值；网页「初始化设置」弹窗里切换后会写入
+#    config.lock.json 覆盖这里，无需手改重启）——
+# kind = "image"  使用上面的静态底图（默认）
+# kind = "camera" 使用本机摄像头（index 为摄像头序号，一般填 0）
+# kind = "stream" 使用网络视频流（url 支持 RTSP / HTTP-MJPEG，如门口旧摄像头）
+[streams.lock_entry.source]
+kind  = "image"
+index = 0
+url   = ""
+
+# —— 内置人脸量化识别 ——
+# photo 为已登记的住户照片；上传的人脸画面或摄像头实时帧与其比对，
+# 距离 ≤ threshold 即判定为本人并自动开锁（阈值越小越严格，允许 0.05~1.5）
+[streams.lock_entry.face]
+photo     = "camera/face.jpg"
+threshold = 0.62   # 实测：本人各姿态 0.25~0.59，他人/镜像 ≥ 0.82，故取 0.62

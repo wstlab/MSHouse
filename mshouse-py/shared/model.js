@@ -28,6 +28,8 @@ export const MSG = {
   PING: "ping",
   PONG: "pong",
   SETUP: "setup",
+  SETUP_AUTH: "setupAuth",
+  FACE_ENROLL: "faceEnroll",
 };
 
 export const ROOMS = [
@@ -174,7 +176,6 @@ export const DEVICE_CATALOG = [
     "floor": 1,
     "capabilities": [
       "lock",
-      "face",
       "stream"
     ],
     "channel": "233667"

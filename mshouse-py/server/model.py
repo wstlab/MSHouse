@@ -40,6 +40,8 @@ class MSG:
     PING = "ping"
     PONG = "pong"
     SETUP = "setup"
+    SETUP_AUTH = "setupAuth"
+    FACE_ENROLL = "faceEnroll"
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,7 @@ DEVICE_CATALOG: tuple[DeviceSpec, ...] = (
     DeviceSpec("ac.living", "ac", "客厅空调", "living", 1, ("switch", "mode", "targetTemp", "fan")),
     DeviceSpec("ac.bedroom", "ac", "卧室空调", "bedroom", 2, ("switch", "mode", "targetTemp", "fan")),
     DeviceSpec("camera.living", "camera", "客厅云台摄像头", "living", 1, ("switch", "pan", "stream"), "233666"),
-    DeviceSpec("lock.entry", "lock", "大门人脸锁", "entry", 1, ("lock", "face", "stream"), "233667"),
+    DeviceSpec("lock.entry", "lock", "大门人脸锁", "entry", 1, ("lock", "stream"), "233667"),
 )
 
 

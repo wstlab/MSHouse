@@ -231,7 +231,8 @@ export class MSHouseScene {
     this.scene.fog = new THREE.Fog(0x16222b, 48, 120);
 
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 400);
-    this.camera.position.set(17, 12.5, 19);
+    // 机位正前偏右、略微仰视角度：房前檐口（地点标牌）落在画面中部、信息胶囊上方
+    this.camera.position.set(12, 4, 21);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 2.6, 0);
@@ -571,6 +572,25 @@ export class MSHouseScene {
     this._box(2.8, 0.18, 1.8, this.mats.slab, DOOR_X, 2.75, Z1 + 0.9, this.root);
     this._box(0.16, 2.9, 0.16, this.mats.metal, DOOR_X - 1.25, 1.45, Z1 + 1.6, this.root);
     this._box(0.16, 2.9, 0.16, this.mats.metal, DOOR_X + 1.25, 1.45, Z1 + 1.6, this.root);
+
+    // 房前正中的地点标牌（站点名，如「浙江温州」）；文字由快照/镜像设置驱动
+    this.siteLabel = new Label({
+      text: "",
+      worldHeight: 0.82,
+      color: "#f6e3bd",
+      font: "800 88px 'PingFang SC','Noto Sans SC',sans-serif",
+      w: 768, h: 176,
+    });
+    // 二层檐口、紧贴前墙：像门头牌匾；默认控制面板展开时文字完整落在信息胶囊上方
+    this.siteLabel.sprite.position.set(0, 6.4, Z1 + 0.2);
+    // 与房间标签一致：教学沙盘里永远不被建筑遮挡
+    this.siteLabel.sprite.material.depthTest = false;
+    this.siteLabel.sprite.renderOrder = 900;
+    this.root.add(this.siteLabel.sprite);
+  }
+
+  setSiteName(name) {
+    this.siteLabel?.setText(String(name || ""));
   }
 
   _buildRoomLabels() {
@@ -1013,6 +1033,7 @@ export class MSHouseScene {
   applySnapshot(snap) {
     if (!snap?.devices) return;
     for (const d of snap.devices) this.applyDeviceState({ deviceId: d.id, state: d.state });
+    if (snap.site) this.setSiteName(snap.site.name);
   }
 
   applyDeviceState(msg) {

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MSHouse 使用文档 · 镜像家居</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2b15a'/%3E%3Cpath d='M8 16l8-6 8 6v9H8z' fill='%231b1408'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg: #0c1210;
+      --ink: #f3efe6;
+      --muted: #9ca89e;
+      --line: rgba(226,177,90,.35);
+      --accent: #e2b15a;
+      --panel: rgba(255,255,255,.04);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.7;
+      font-size: 14px;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: rgba(12,18,16,.92);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+    header .mark {
+      width: 38px; height: 38px; border-radius: 12px;
+      background: linear-gradient(160deg, rgba(226,177,90,.95), rgba(125,206,160,.55));
+      display: grid; place-items: center; font-weight: 700; color: #0c1210;
+    }
+    header h1 { margin: 0; font-size: 16px; }
+    header p { margin: 0; font-size: 12px; color: var(--muted); }
+    header .spacer { flex: 1; }
+    header a {
+      color: var(--ink);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      padding: 7px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      transition: 160ms ease;
+    }
+    header a:hover { transform: translateY(-1px); border-color: var(--accent); }
+    main { max-width: 900px; margin-left: 220px; margin-right: 18px; padding: 26px 18px 80px; }
+    h2 { font-size: 22px; margin: 36px 0 14px; color: var(--accent); }
+    h3 { font-size: 16px; margin: 26px 0 10px; color: #d4c9a6; }
+    p { margin: 10px 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    code {
+      background: rgba(226,177,90,.12);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: "SF Mono", "IBM Plex Mono", Consolas, monospace;
+      font-size: 12.5px;
+    }
+    pre {
+      background: rgba(0,0,0,.28);
+      border: 1px solid rgba(226,177,90,.18);
+      border-radius: 12px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+    pre code { background: transparent; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 13px;
+    }
+    th, td {
+      border: 1px solid rgba(226,177,90,.18);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: rgba(226,177,90,.12); }
+    .note {
+      border-left: 3px solid var(--accent);
+      background: rgba(226,177,90,.08);
+      padding: 10px 14px;
+      border-radius: 0 10px 10px 0;
+      margin: 14px 0;
+      color: #e8dec5;
+    }
+
+    /* 左侧固定目录 */
+    .toc {
+      position: fixed;
+      left: 18px;
+      top: 92px;
+      width: 190px;
+      max-height: calc(100vh - 110px);
+      overflow: auto;
+      background: rgba(12,18,16,.95);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 16px;
+      z-index: 20;
+    }
+    .toc strong { display: block; margin-bottom: 6px; color: var(--accent); }
+    .toc a { color: var(--ink); text-decoration: none; display: block; padding: 4px 0; }
+    .toc a:hover { color: var(--accent); }
+
+    /* WebSocket 在线测试器 */
+    .ws-tester {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,.03);
+      margin: 12px 0;
+    }
+    .ws-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+    .ws-tester input[type="text"] {
+      flex: 1 1 240px;
+      background: #18241f;
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font-size: 13px;
+    }
+    .ws-tester button, .ws-tester select {
+      background: rgba(255,255,255,.06);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .ws-tester button.primary {
+      background: linear-gradient(180deg, rgba(226,177,90,.95), rgba(196,140,62,.92));
+      color: #1b1408;
+      border-color: transparent;
+      font-weight: 700;
+    }
+    .ws-tester button:hover { transform: translateY(-1px); }
+    .ws-tester label { display: block; margin: 10px 0 6px; color: var(--muted); font-size: 12px; }
+    .ws-tester label.inline { display: inline-block; margin: 0 6px 0 0; }
+    .ws-tester textarea {
+      width: 100%;
+      height: 90px;
+      background: #18241f;
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 10px;
+      font-family: "SF Mono", "IBM Plex Mono", Consolas, monospace;
+      font-size: 12px;
+      resize: vertical;
+    }
+    .ws-log {
+      height: 180px;
+      overflow: auto;
+      background: rgba(0,0,0,.28);
+      border: 1px solid rgba(226,177,90,.18);
+      border-radius: 10px;
+      padding: 10px;
+      font-family: "SF Mono", "IBM Plex Mono", Consolas, monospace;
+      font-size: 11.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .ws-log .out { color: #7dcea0; }
+    .ws-log .in { color: #8ecae6; }
+    .ws-log .err { color: #ef6f6c; }
+    #wsStatus { font-weight: 700; }
+    #wsPreview {
+      background: rgba(0,0,0,.28);
+      border: 1px solid rgba(226,177,90,.18);
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 80px;
+      margin: 6px 0 10px;
+      overflow-x: auto;
+    }
+    #wsPreview code { background: transparent; padding: 0; }
+
+    @media (max-width: 640px) {
+      header h1 { display: none; }
+      .toc { position: relative; left: auto; top: auto; width: auto; margin: 18px 18px 0; z-index: 0; }
+      main { margin-left: 0; padding: 18px 14px 60px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="mark">MS</div>
+    <div>
+      <h1>MSHouse · 镜像家居</h1>
+      <p>智能家居数字孪生教学沙盘 · 使用文档</p>
+    </div>
+    <div class="spacer"></div>
+    <a href="/">返回首页</a>
+  </header>
+
+  <nav class="toc">
+    <strong>目录</strong>
+    <a href="#overview">1. 概述</a>
+    <a href="#devices">2. 设备清单</a>
+    <a href="#workflow">3. 工作流程</a>
+    <a href="#ws">4. WebSocket 接口</a>
+    <a href="#mqtt">5. MQTT 接口</a>
+    <a href="#apps">6. 应用与生态</a>
+  </nav>
+
+  <main>
+    <h2 id="overview">1. 概述</h2>
+    <p>
+      MSHouse 是一套<strong>纯软件运行的虚拟智能家居</strong>，用数字孪生的方式还原一栋两层别墅：
+      客厅、厨房、主卧、卫生间、门厅五个房间，灯、空调、温湿度传感器、云台摄像头、人脸门锁五类设备。
+      所有设备都有真实的状态、响应与联动逻辑，不依赖任何实体硬件，适合课堂教学、协议演示与二次开发。
+    </p>
+    <p>
+      系统分为两层：
+    </p>
+    <ul>
+      <li><strong>网关（server）</strong>：FastAPI + asyncio，维护设备影子、执行场景、广播状态、提供 MJPEG 画面流。</li>
+      <li><strong>呈现（public）</strong>：Three.js 三维沙盘 + 控制面板，与网关通过 WebSocket 通信。</li>
+    </ul>
+    <p>
+      核心设计是<strong>协议与呈现分离</strong>：只要理解 WebSocket/MQTT 报文，就能用任意语言或平台控制这栋房子。
+    </p>
+
+    <h2 id="devices">2. 设备清单</h2>
+    <table>
+      <tr><th>设备 ID</th><th>类型</th><th>房间</th><th>能力</th></tr>
+      <tr><td><code>light.living</code></td><td>智能灯</td><td>客厅</td><td>开关、亮度 0–100、色温 2700–6500 K</td></tr>
+      <tr><td><code>light.kitchen</code></td><td>智能灯</td><td>厨房</td><td>同上</td></tr>
+      <tr><td><code>light.bedroom</code></td><td>智能灯</td><td>主卧</td><td>同上</td></tr>
+      <tr><td><code>light.bath</code></td><td>智能灯</td><td>卫生间</td><td>同上</td></tr>
+      <tr><td><code>ac.living</code></td><td>空调</td><td>客厅</td><td>开关、模式、目标温度 16–30 ℃、风速</td></tr>
+      <tr><td><code>ac.bedroom</code></td><td>空调</td><td>主卧</td><td>同上</td></tr>
+      <tr><td><code>sensor.living</code></td><td>温湿度</td><td>客厅</td><td>温度、湿度、舒适度（只读）</td></tr>
+      <tr><td><code>sensor.kitchen</code></td><td>温湿度</td><td>厨房</td><td>同上</td></tr>
+      <tr><td><code>sensor.bedroom</code></td><td>温湿度</td><td>主卧</td><td>同上</td></tr>
+      <tr><td><code>sensor.bath</code></td><td>温湿度</td><td>卫生间</td><td>同上</td></tr>
+      <tr><td><code>camera.living</code></td><td>摄像头</td><td>客厅</td><td>开关、云台 0–359°、布防、移动侦测、推流</td></tr>
+      <tr><td><code>lock.entry</code></td><td>人脸锁</td><td>门厅</td><td>上锁 / 开锁、人脸画面识别、视频推流</td></tr>
+    </table>
+
+    <h2 id="workflow">3. 工作流程</h2>
+    <h3>3.1 启动</h3>
+    <ol>
+      <li>安装依赖：<code>pip install -r requirements.txt</code></li>
+      <li>启动网关：<code>python -m server.main</code>（默认 <code>http://localhost:8080</code>）</li>
+      <li>浏览器打开首页，WebSocket 自动连接并拉取全量设备影子。</li>
+    </ol>
+
+    <h3>3.2 首次使用</h3>
+    <p>
+      点击顶部「设置」按钮，输入口令 <code>villa</code> 后可写入住宅位置（经纬度、地点名）。
+      写入后网关会按当地天气预报初始化室外温湿度，并影响室内传感器与空调的初始值。
+      你也可以在设置里把大门锁画面来源切换为：静态画面（默认，按天气切换）、本机摄像头、网络视频流（RTSP / HTTP-MJPEG）。
+    </p>
+
+    <h3>3.3 日常交互</h3>
+    <ul>
+      <li><strong>三维视图</strong>：拖拽旋转、滚轮缩放、点击设备查看高亮。房子前方显示当前地点名称。</li>
+      <li><strong>控制面板</strong>：右侧「控制」标签分页列出所有设备卡片，可直接开关、调光、调温、转动云台、上锁/开锁。</li>
+      <li><strong>场景按钮</strong>：顶栏「回家 / 离家 / 睡眠 / 观影」一键批量切换多设备状态。</li>
+      <li><strong>画面标签</strong>：开启摄像头或门锁的 MJPEG 推流，实时观看画面；锁画面可上传人脸照片作为登记住户。</li>
+      <li><strong>报文标签</strong>：查看所有 WebSocket 收发报文，用于协议教学与调试。</li>
+    </ul>
+
+    <h3>3.4 人脸开锁与登记</h3>
+    <p>
+      当锁画面来源为摄像头/视频流并开启推送时，网关会对每帧做人脸检测：
+    </p>
+    <ul>
+      <li>识别到已登记人脸 → 自动开锁，状态显示「识别通过 · 姓名」。</li>
+      <li>识别到未登记人脸 → 连续确认后弹出横幅询问「是否登记用户」，可命名保存到 <code>camera/faces/</code>，重启仍有效。</li>
+    </ul>
+    <div class="note">
+      旧版「模拟住户人脸 / 模拟访客」按钮已移除；人脸识别完全由上传画面或摄像头实时帧驱动。
+    </div>
+
+    <h2 id="ws">4. WebSocket 接口</h2>
+    <p>
+      端点：<code>ws://&lt;host&gt;:&lt;port&gt;/ws</code>。建链后服务端主动推 <code>hello</code>、<code>snapshot</code>、<code>event</code>。
+      所有消息使用同一信封：
+    </p>
+    <pre><code>{ "v": "1.0", "type": "command", "id": "ui-xxx", "ts": 1796000000000,
+  "payload": { "deviceId": "light.living", "action": "set",
+               "params": { "power": true, "brightness": 80 } } }</code></pre>
+
+    <h3>4.1 控制设备</h3>
+    <table>
+      <tr><th>设备类型</th><th>action</th><th>params</th></tr>
+      <tr><td>light</td><td><code>on / off / toggle / set</code></td><td><code>{ power, brightness, colorTemp }</code></td></tr>
+      <tr><td>ac</td><td><code>on / off / toggle / set</code></td><td><code>{ power, mode, targetTemp, fan }</code></td></tr>
+      <tr><td>camera</td><td><code>set / pan / nudge / arm</code></td><td><code>{ power, streaming, armed }</code> / <code>{ pan }</code> / <code>{ delta }</code> / <code>{ armed }</code></td></tr>
+      <tr><td>lock</td><td><code>lock / unlock</code></td><td>可选 <code>{ person }</code></td></tr>
+    </table>
+
+    <h3>4.2 场景</h3>
+    <pre><code>{ "type": "scene", "payload": { "sceneId": "home" } }</code></pre>
+    <p>可用场景：<code>home</code>（回家）、<code>away</code>（离家）、<code>sleep</code>（睡眠）、<code>movie</code>（观影）。</p>
+
+    <h3>4.3 关键消息类型</h3>
+    <table>
+      <tr><th>方向</th><th>type</th><th>作用</th></tr>
+      <tr><td>S→C</td><td><code>snapshot</code></td><td>全量设备影子、场景、站点、天气、最近事件</td></tr>
+      <tr><td>S→C</td><td><code>state</code></td><td>单设备增量更新，所有客户端广播</td></tr>
+      <tr><td>S→C</td><td><code>event</code></td><td>日志与安防事件</td></tr>
+      <tr><td>S→C</td><td><code>ack</code></td><td>命令回执，<code>ref</code> 关联请求 <code>id</code></td></tr>
+      <tr><td>S→C</td><td><code>video</code></td><td>流信令（通道、推流状态、云台、识别结果）</td></tr>
+      <tr><td>S→C</td><td><code>faceEnroll</code></td><td>陌生脸登记询问</td></tr>
+      <tr><td>C→S</td><td><code>command / scene / snapshot / setup / ping</code></td><td>控制、切场景、拉全量、写位置、心跳</td></tr>
+    </table>
+
+    <h3>4.4 视频流</h3>
+    <p>
+      像素不走 WebSocket，直接通过 HTTP 长连接拉 MJPEG：
+    </p>
+    <pre><code>&lt;img src="http://localhost:8080/?stream=233666" /&gt;</code></pre>
+    <p>
+      通道分配：客厅摄像头 <code>233666</code>，大门人脸锁 <code>233667</code>。
+      先用 <code>command</code> 发 <code>stream: { on: true }</code> 开启推流，再打开 <code>&lt;img&gt;</code>。
+    </p>
+
+    <h3>4.5 在线测试</h3>
+    <p>
+      下面是一个可直接运行的 WebSocket 调试器。点击「连接」后，先在下拉菜单里选择设备，再选择动作，
+      报文会自动生成，点击「发送」即可控制房子。
+    </p>
+    <div class="ws-tester">
+      <div class="ws-row">
+        <input type="text" id="wsUrl" placeholder="ws://localhost:8080/ws" />
+        <button id="wsConnect" class="primary">连接</button>
+        <button id="wsDisconnect">断开</button>
+        <span class="meta" id="wsStatus">未连接</span>
+      </div>
+      <div class="ws-row" style="align-items:center;">
+        <label for="wsDevice" class="inline">设备</label>
+        <select id="wsDevice"></select>
+        <label for="wsAction" class="inline">动作</label>
+        <select id="wsAction"></select>
+        <button id="wsSend" class="primary">发送</button>
+        <button id="wsClearLog">清空日志</button>
+      </div>
+      <label for="wsPreview">自动生成的报文</label>
+      <pre id="wsPreview"><code>请先选择设备和动作</code></pre>
+      <div class="ws-log" id="wsLog"></div>
+    </div>
+
+    <h2 id="mqtt">5. MQTT 接口</h2>
+    <p>
+      项目内置 <code>integrations/ha_bridge.py</code>，它是一个<strong>零侵入的双向 MQTT 桥接器</strong>：
+      作为普通 WebSocket 客户端连网关，同时作为 MQTT 客户端连 broker。
+    </p>
+    <h3>5.1 启动桥接器</h3>
+    <pre><code>pip install paho-mqtt websockets
+python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
+
+    <h3>5.2 状态主题</h3>
+    <table>
+      <tr><th>主题</th><th>说明</th></tr>
+      <tr><td><code>mshouse/&lt;deviceId&gt;/state</code></td><td>设备状态，retained</td></tr>
+      <tr><td><code>mshouse/gateway/state</code></td><td>当前场景、在家状态、室外温湿度、地点名</td></tr>
+      <tr><td><code>mshouse/event</code></td><td>事件流（安防告警、场景切换）</td></tr>
+      <tr><td><code>mshouse/bridge/status</code></td><td>桥接器在线状态（LWT 遗嘱）</td></tr>
+    </table>
+
+    <h3>5.3 命令主题</h3>
+    <table>
+      <tr><th>主题</th><th>负载示例</th></tr>
+      <tr><td><code>mshouse/light.living/set</code></td><td><code>{"state":"ON","brightness":80}</code> 或 <code>OFF</code></td></tr>
+      <tr><td><code>mshouse/lock.entry/set</code></td><td><code>LOCK</code> / <code>UNLOCK</code></td></tr>
+      <tr><td><code>mshouse/ac.living/power/set</code></td><td><code>ON</code> / <code>OFF</code></td></tr>
+      <tr><td><code>mshouse/ac.living/mode/set</code></td><td><code>cool</code> / <code>heat</code> / <code>fan_only</code> / <code>dry</code> / <code>auto</code></td></tr>
+      <tr><td><code>mshouse/ac.living/temp/set</code></td><td><code>25</code></td></tr>
+      <tr><td><code>mshouse/ac.living/fan/set</code></td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>auto</code></td></tr>
+      <tr><td><code>mshouse/camera.living/stream/set</code></td><td><code>ON</code> / <code>OFF</code></td></tr>
+      <tr><td><code>mshouse/camera.living/pan/set</code></td><td><code>180</code></td></tr>
+      <tr><td><code>mshouse/scene/home/set</code></td><td><code>PRESS</code></td></tr>
+    </table>
+    <div class="note">
+      注意枚举翻译：网关内部风速用 <code>mid</code>，MQTT 侧需用 <code>medium</code>；空调模式网关用 <code>fan</code>，MQTT 侧需用 <code>fan_only</code>。桥接器会自动翻译，直接发送 HA 风格值即可。
+    </div>
+
+    <h2 id="apps">6. 应用与生态</h2>
+    <h3>6.1 接入 Home Assistant</h3>
+    <p>
+      桥接器启动后会向 <code>homeassistant/&lt;component&gt;/&lt;object_id&gt;/config</code> 发布自动发现配置，
+      HA 里只要添加 MQTT 集成，实体就会自动出现，无需写 YAML。
+      摄像头画面需额外在 <code>configuration.yaml</code> 配一个 <code>mjpeg</code> 平台（MQTT Discovery 不支持 camera 实体）。
+    </p>
+
+    <h3>6.2 二次开发 / 自己写客户端</h3>
+    <ul>
+      <li>参考 <code>public/demo.html</code>：单文件、零依赖、完整展示了协议收发。</li>
+      <li>参考 <code>scripts/selfcheck.py</code>：Python 版协议自检，展示了如何等待 ack、断言状态。</li>
+      <li>参考 <code>integrations/ha_bridge.py</code>：如何把网关协议翻译成 MQTT。</li>
+    </ul>
+
+    <h3>6.3 与真实硬件结合</h3>
+    <p>
+      把门锁画面来源改成 RTSP 摄像头，或把门厅画面改成真实门口摄像头，即可用真实人脸开门；
+      把客厅摄像头画面来源改成真实摄像头，即可在三维沙盘中看到真实房间画面。
+      服务端做来源切换，客户端一行代码不用改。
+    </p>
+
+    <h3>6.4 教学用途</h3>
+    <ul>
+      <li><strong>协议课</strong>：用报文面板展示 WebSocket 全双工、ack/state 分离、广播与回执。</li>
+      <li><strong>物联网课</strong>：用 MQTT 桥接器展示私有协议 → 标准协议的转换、retained 状态、LWT 可用性。</li>
+      <li><strong>数字孪生课</strong>：用三维沙盘展示 CPS 映射——点击虚拟设备控制真实（或虚拟）物理状态。</li>
+      <li><strong>自动化课</strong>：在 HA 里写自动化，用这栋虚拟别墅验证规则，再迁移到真实设备。</li>
+    </ul>
+  </main>
+
+  <script>
+    (function () {
+      const wsUrl = document.getElementById('wsUrl');
+      const wsStatus = document.getElementById('wsStatus');
+      const wsLog = document.getElementById('wsLog');
+      const wsDevice = document.getElementById('wsDevice');
+      const wsAction = document.getElementById('wsAction');
+      const wsPreview = document.getElementById('wsPreview');
+      let ws = null;
+      let seq = 1;
+
+      function nextId() {
+        return `ui-${Date.now().toString(36)}-${seq++}`;
+      }
+
+      function envelope(type, payload) {
+        return { v: "1.0", type, id: nextId(), ts: Date.now(), payload };
+      }
+
+      function log(cls, text) {
+        const line = document.createElement('div');
+        line.className = cls;
+        line.textContent = `${new Date().toLocaleTimeString('zh-CN')}  ${text}`;
+        wsLog.appendChild(line);
+        wsLog.scrollTop = wsLog.scrollHeight;
+      }
+
+      function setStatus(text, ok) {
+        wsStatus.textContent = text;
+        wsStatus.style.color = ok ? '#7dcea0' : ok === false ? '#ef6f6c' : '';
+      }
+
+      wsUrl.value = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+
+      const devices = [
+        { id: 'light.living', name: '客厅主灯', type: 'light' },
+        { id: 'light.kitchen', name: '厨房灯', type: 'light' },
+        { id: 'light.bedroom', name: '卧室灯', type: 'light' },
+        { id: 'light.bath', name: '卫生间灯', type: 'light' },
+        { id: 'ac.living', name: '客厅空调', type: 'ac' },
+        { id: 'ac.bedroom', name: '卧室空调', type: 'ac' },
+        { id: 'camera.living', name: '客厅云台', type: 'camera' },
+        { id: 'lock.entry', name: '大门人脸锁', type: 'lock' },
+        { id: '_scene', name: '场景', type: 'scene' },
+      ];
+
+      const actions = {
+        light: [
+          { action: 'on', label: '开灯', params: {} },
+          { action: 'off', label: '关灯', params: {} },
+          { action: 'set', label: '设置（亮度/色温）', params: { power: true, brightness: 80, colorTemp: 4000 } },
+        ],
+        ac: [
+          { action: 'on', label: '开空调', params: {} },
+          { action: 'off', label: '关空调', params: {} },
+          { action: 'set', label: '设置（模式/温度/风速）', params: { power: true, mode: 'cool', targetTemp: 26, fan: 'auto' } },
+        ],
+        camera: [
+          { action: 'set', label: '设置（开关/推流）', params: { power: true, streaming: true } },
+          { action: 'pan', label: '转动到 90°', params: { pan: 90 } },
+          { action: 'nudge', label: '微调 +15°', params: { delta: 15 } },
+          { action: 'arm', label: '布防', params: { armed: true } },
+        ],
+        lock: [
+          { action: 'lock', label: '上锁', params: {} },
+          { action: 'unlock', label: '开锁', params: {} },
+        ],
+        scene: [
+          { action: 'home', label: '回家', params: { sceneId: 'home' } },
+          { action: 'away', label: '离家', params: { sceneId: 'away' } },
+          { action: 'sleep', label: '睡眠', params: { sceneId: 'sleep' } },
+          { action: 'movie', label: '观影', params: { sceneId: 'movie' } },
+        ],
+      };
+
+      function renderDevices() {
+        wsDevice.innerHTML = '<option value="">请选择设备</option>';
+        devices.forEach(d => {
+          const opt = document.createElement('option');
+          opt.value = d.id;
+          opt.textContent = d.name;
+          wsDevice.appendChild(opt);
+        });
+      }
+
+      function renderActions(type) {
+        wsAction.innerHTML = '<option value="">请选择动作</option>';
+        (actions[type] || []).forEach((a, i) => {
+          const opt = document.createElement('option');
+          opt.value = String(i);
+          opt.textContent = a.label;
+          wsAction.appendChild(opt);
+        });
+      }
+
+      function buildMessage() {
+        const dev = devices.find(d => d.id === wsDevice.value);
+        const idx = wsAction.value;
+        if (!dev || idx === '') return null;
+        const act = actions[dev.type][Number(idx)];
+        if (dev.type === 'scene') return envelope('scene', act.params);
+        return envelope('command', { deviceId: dev.id, action: act.action, params: act.params });
+      }
+
+      function updatePreview() {
+        const msg = buildMessage();
+        wsPreview.innerHTML = msg ? '<code>' + JSON.stringify(msg, null, 2) + '</code>' : '<code>请先选择设备和动作</code>';
+      }
+
+      wsDevice.addEventListener('change', () => {
+        const dev = devices.find(d => d.id === wsDevice.value);
+        renderActions(dev ? dev.type : '');
+        updatePreview();
+      });
+      wsAction.addEventListener('change', updatePreview);
+
+      document.getElementById('wsConnect').addEventListener('click', () => {
+        if (ws) { log('err', '已存在连接，请先断开'); return; }
+        const url = wsUrl.value.trim();
+        if (!url) return;
+        setStatus('连接中…');
+        ws = new WebSocket(url);
+        ws.onopen = () => { setStatus('已连接', true); };
+        ws.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            log('in', `← ${msg.type}${msg.id ? ' · ' + msg.id : ''}\n` + JSON.stringify(msg, null, 2));
+          } catch (err) {
+            log('in', '← ' + e.data);
+          }
+        };
+        ws.onerror = () => { setStatus('连接错误', false); log('err', 'WebSocket 发生错误'); };
+        ws.onclose = () => { setStatus('已断开', false); ws = null; log('err', '连接已关闭'); };
+      });
+
+      document.getElementById('wsDisconnect').addEventListener('click', () => {
+        if (ws) { ws.close(); }
+      });
+
+      document.getElementById('wsClearLog').addEventListener('click', () => { wsLog.innerHTML = ''; });
+
+      document.getElementById('wsSend').addEventListener('click', () => {
+        if (!ws || ws.readyState !== 1) { log('err', 'WebSocket 未连接'); return; }
+        const msg = buildMessage();
+        if (!msg) { log('err', '请先选择设备和动作'); return; }
+        ws.send(JSON.stringify(msg));
+        log('out', `→ ${msg.type}\n` + JSON.stringify(msg, null, 2));
+      });
+
+      renderDevices();
+      updatePreview();
+    })();
+  </script>
+</body>
+</html>

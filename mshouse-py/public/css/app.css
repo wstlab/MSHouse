@@ -77,6 +77,11 @@ body.panel-hidden .topbar { right: 16px; }
   padding: 8px 12px;
   transition: 160ms ease;
   white-space: nowrap;
+  font-size: 13px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .scene-btn.active, .chip.on, .ctrl button.primary {
   background: linear-gradient(180deg, rgba(226,177,90,.95), rgba(196,140,62,.92));
@@ -85,6 +90,16 @@ body.panel-hidden .topbar { right: 16px; }
   font-weight: 700;
 }
 .scene-btn:hover, .chip:hover, .ctrl button:hover, .mini:hover { transform: translateY(-1px); }
+
+/* 文档链接按钮：与 button.chip 视觉完全一致 */
+#docsBtn, a.chip {
+  text-decoration: none;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
 
 .hud {
   position: fixed;
@@ -254,6 +269,41 @@ select {
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+/* 首页「欢迎回家」浮层：每次访问自动出现，约 2.6 秒后淡出 */
+.welcome {
+  position: fixed;
+  inset: 0;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 10, 9, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 320ms ease;
+}
+.welcome.show { opacity: 1; }
+.welcome-card {
+  text-align: center;
+  padding: 30px 46px 26px;
+  border-radius: 24px;
+  background: rgba(20, 27, 24, 0.92);
+  border: 1px solid rgba(226, 177, 90, 0.55);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+  transform: translateY(10px) scale(0.96);
+  transition: transform 320ms ease;
+}
+.welcome.show .welcome-card { transform: translateY(0) scale(1); }
+.welcome-emoji { font-size: 46px; line-height: 1; }
+.welcome-title {
+  margin-top: 12px;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #f3efe6;
+}
+.welcome-sub { margin-top: 8px; font-size: 13px; color: #cbb98d; }
+
 .setup {
   border: 1px solid var(--line);
   border-radius: 22px;
@@ -278,7 +328,29 @@ select {
   font-size: 14px;
 }
 .setup .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.setup select {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #18241f;
+  color: var(--ink);
+  padding: 9px 10px;
+  font-size: 13px;
+}
+.setup-sep { height: 1px; margin: 2px 0; background: var(--line); opacity: 0.7; }
+.setup-card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+  background: rgba(255,255,255,0.02);
+}
+.setup-card h3 { margin: 0; font-size: 13px; color: var(--gold, #e2b15a); letter-spacing: .04em; }
 .setup footer { display: flex; justify-content: flex-end; gap: 8px; }
+#setupAuthPane, #setupCardsPane { display: grid; gap: 12px; }
+#setupAuthPane[hidden], #setupCardsPane[hidden] { display: none; }
+#setupCardsPane { max-height: min(82vh, 720px); overflow-y: auto; }
 .setup .primary {
   border: 0;
   border-radius: 999px;
@@ -288,6 +360,28 @@ select {
   color: #1b1408;
 }
 .setup-error { margin: 0; color: var(--danger); font-size: 12px; }
+
+/* 大门锁：未登记人脸「是否登记用户」询问横幅 */
+.enroll-banner {
+  margin-top: 10px;
+  border: 1px solid rgba(226, 177, 90, 0.55);
+  background: rgba(226, 177, 90, 0.1);
+  border-radius: 14px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+.enroll-banner[hidden] { display: none; }
+.enroll-title { margin: 0; font-size: 13px; font-weight: 700; color: #e2b15a; }
+.enroll-banner input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #18241f;
+  color: var(--ink);
+  padding: 7px 10px;
+  font-size: 13px;
+}
 
 @media (max-width: 1180px) {
   /* 单行排不下时，先让副标题让位，避免场景菜单被挤到第二行 */

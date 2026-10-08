@@ -21,8 +21,10 @@ from __future__ import annotations
 import math
 import time
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from .raster import Camera, Face, Light, Raster, box_faces, draw_scene, kelvin, quad
 
@@ -63,6 +65,7 @@ NAME_ASCII = {
     "林晓": "LIN XIAO",
     "陈舟": "CHEN ZHOU",
     "未登记访客": "UNKNOWN GUEST",
+    "登记住户": "RESIDENT",
 }
 
 # 绘制层级：0 壳体 → 1 贴附物 → 2 家具（详见 raster.draw_scene）
@@ -236,7 +239,8 @@ class LivingRoomSource:
         self._smooth = {"pan": 0.0, "inited": False}
 
     def render(self, *, state: dict | None = None, env: dict | None = None,
-               now: int | None = None, dt: float = 0.125, fps: int = 8) -> Raster:
+               now: int | None = None, dt: float = 0.125, fps: int = 8,
+               channel: str | None = None, name: str | None = None) -> Raster:
         state = state or {}
         env = env or {}
         now = now if now is not None else int(time.time() * 1000)
@@ -263,100 +267,250 @@ class LivingRoomSource:
         return raster
 
 
-class EntrySource:
-    """大门人脸锁：门外视角。"""
+def _cover_crop(img: Image.Image, width: int, height: int) -> Image.Image:
+    """把任意比例的图片等比缩放后居中 cover 裁剪到目标分辨率。"""
+    w, h = img.size
+    scale = max(width / w, height / h)
+    nw = max(width, int(round(w * scale)))
+    nh = max(height, int(round(h * scale)))
+    img = img.resize((nw, nh), Image.LANCZOS)
+    x = (nw - width) // 2
+    y = (nh - height) // 2
+    return img.crop((x, y, x + width, y + height))
 
-    _bg_cache: dict[tuple[int, int], np.ndarray] = {}
+
+class EntrySource:
+    """
+    大门人脸锁：门外视角。
+
+    默认画面优先取 default_image 指向的图片文件（config.toml 里配置，
+    教学素材是 camera/lock.jpg 拍的草坪与道路）；文件缺失时才用程序合成
+    的草坪道路兜底。当网关上有「上传的人脸画面」时（env.faceImage 传入一张
+    已裁好的 PIL 图），画面切换为该人脸，并叠加识别框与 OSD。
+    """
+
+    _bg_cache: dict[tuple[object, int, int], np.ndarray] = {}
 
     def __init__(self, width: int = 512, height: int = 320,
-                 channel: str = "", label: str = "ENTRY LOCK") -> None:
+                 channel: str = "", label: str = "ENTRY LOCK",
+                 default_image: str | Path | None = None) -> None:
         self.width = width
         self.height = height
         self.channel = channel
         self.label = label
+        self.default_image = Path(default_image) if default_image else None
+        # 缺失文件只告警一次，避免每帧刷日志
+        self._missing_warned: set[str] = set()
 
-    def _background(self) -> np.ndarray:
-        """门外走廊：中间亮、四周暗。原版是逐像素循环，这里向量化并缓存。"""
-        key = (self.width, self.height)
+    # ------------------------------------------------------------------ #
+    # 外景：优先读指定场景图片（晴/雨/雪/雾/夜），读不到再程序合成兜底
+    # ------------------------------------------------------------------ #
+    def _background(self, image_path: str | Path | None = None) -> np.ndarray:
+        path = Path(image_path) if image_path else self.default_image
+        key = (str(path) if path else None, self.width, self.height)
         bg = EntrySource._bg_cache.get(key)
-        if bg is None:
-            w, h = self.width, self.height
-            cx, cy = w / 2, h * 0.44
-            yy, xx = np.mgrid[0:h, 0:w]
-            d = np.hypot(xx - cx, yy - cy) / math.hypot(cx, cy)
-            t = np.minimum(1.0, d * 1.15)
-            k = (1.0 - t) ** 1.6
-            bg = np.empty((h, w, 3), dtype=np.uint8)
-            bg[:, :, 0] = np.clip(18 + 52 * k, 0, 255).astype(np.uint8)
-            bg[:, :, 1] = np.clip(24 + 62 * k, 0, 255).astype(np.uint8)
-            bg[:, :, 2] = np.clip(22 + 56 * k, 0, 255).astype(np.uint8)
-            EntrySource._bg_cache[key] = bg
-        return bg
+        if bg is not None:
+            return bg
+
+        if path is not None:
+            loaded = self._background_from_file(path)
+            if loaded is not None:
+                EntrySource._bg_cache[key] = loaded
+                return loaded
+
+        EntrySource._bg_cache[key] = self._background_procedural()
+        return EntrySource._bg_cache[key]
+
+    def _background_from_file(self, path: Path) -> np.ndarray | None:
+        try:
+            with Image.open(path) as img:
+                img.load()
+                img = img.convert("RGB")
+                if img.size != (self.width, self.height):
+                    img = _cover_crop(img, self.width, self.height)
+                return np.asarray(img).copy()
+        except FileNotFoundError:
+            if str(path) not in self._missing_warned:
+                self._missing_warned.add(str(path))
+                print(f"[render] 大门锁画面 {path} 不存在，改用程序合成画面")
+        except Exception as err:
+            if str(path) not in self._missing_warned:
+                self._missing_warned.add(str(path))
+                print(f"[render] 大门锁画面 {path} 读取失败（{err!r}），改用程序合成画面")
+        return None
+
+    def _background_procedural(self) -> np.ndarray:
+        """程序合成的门外草坪道路：文件素材缺失时的兜底，按分辨率缓存。"""
+        w, h = self.width, self.height
+        r = Raster(w, h)
+        horizon = int(h * 0.42)
+        cx = w / 2
+
+        # 天空：竖直渐变 + 两朵云
+        r.v_gradient(0, 0, w, horizon + 1, (122, 174, 214), (212, 230, 236))
+        for ex, ey, rx, ry in ((96, 40, 34, 10), (126, 32, 20, 7), (372, 50, 42, 11), (408, 42, 22, 8)):
+            r.ellipse(ex, ey, rx, ry, (244, 248, 248), 0.75)
+
+        # 远处树线：一条暗带 + 一串树冠
+        r.fill_rect(0, horizon - 8, w, 12, (60, 100, 62))
+        for i, x in enumerate(range(-20, w + 30, 34)):
+            r.ellipse(x, horizon - 12, 26, 18, (66, 112, 66) if i % 2 else (76, 124, 72))
+
+        # 草坪：先铺底色与剪草条纹，再撒草叶纹理
+        r.fill_rect(0, horizon, w, h - horizon, (96, 142, 78))
+        bands = 9
+        for i in range(bands):
+            y0 = horizon + (h - horizon) * i / bands
+            y1 = horizon + (h - horizon) * (i + 1) / bands
+            if i % 2 == 0:
+                r.fill_rect(0, y0, w, y1 - y0 + 1, (88, 132, 72))
+        rng = np.random.default_rng(42)
+        for _ in range(320):
+            gx = float(rng.integers(0, w))
+            gy = float(rng.integers(horizon, h))
+            r.line(gx, gy, gx - 1.0, gy - float(rng.integers(2, 6)), (78, 118, 62), 1)
+
+        # 通向院门的道路：路缘 + 沥青面 + 透视虚线
+        near_half, far_half = 118.0, 13.0
+        r.fill_poly([(cx - near_half - 5, h), (cx + near_half + 5, h),
+                     (cx + far_half + 2, horizon), (cx - far_half - 2, horizon)], (118, 112, 102))
+        r.fill_poly([(cx - near_half, h), (cx + near_half, h),
+                     (cx + far_half, horizon), (cx - far_half, horizon)], (104, 106, 108))
+        for edge in (-1, 1):
+            r.line(cx + edge * far_half, horizon, cx + edge * near_half, h, (226, 222, 196), 1, 0.55)
+        for i in range(9):
+            t = 0.05 + i * 0.115
+            y = horizon + (h - horizon - 6) * t
+            half = far_half + (near_half - far_half) * t
+            dl = 3 + 18 * t
+            dw = max(1, int(round(1 + 2.4 * t)))
+            r.fill_rect(cx - dw / 2, y, dw, dl, (216, 210, 168), 0.8)
+
+        # 院门立柱与两侧围栏
+        for side in (-1, 1):
+            px = cx + side * (far_half + 7)
+            r.fill_rect(px - 6, horizon - 36, 12, 36, (156, 102, 74))
+            r.fill_rect(px - 8, horizon - 40, 16, 5, (184, 130, 94))
+            rail_x0, rail_x1 = (px + 8, w - 4) if side > 0 else (4, px - 8)
+            for ry in (horizon - 24, horizon - 10):
+                r.line(rail_x0, ry, rail_x1, ry, (232, 230, 214), 2, 0.7)
+            posts = np.arange(rail_x0, rail_x1, 26)
+            for post_x in posts:
+                r.fill_rect(post_x - 1, horizon - 30, 2, 24, (122, 112, 96), 0.9)
+
+        # 两侧的树与近处灌木丛，把道路夹在中间
+        for tx in (66, w - 66):
+            r.fill_rect(tx - 4, horizon - 34, 8, 40, (96, 70, 50))
+            r.ellipse(tx, horizon - 48, 32, 26, (60, 106, 64))
+            r.ellipse(tx - 18, horizon - 38, 18, 14, (70, 118, 70))
+            r.ellipse(tx + 18, horizon - 40, 18, 15, (74, 122, 72))
+        for bx0, bx1, by in ((30, 118, h - 18), (w - 118, w - 30, h - 18), (118, 176, h - 6), (w - 176, w - 118, h - 6)):
+            for x in np.linspace(bx0, bx1, 4):
+                r.ellipse(float(x), by, 34, 26, (54, 96, 58))
+                r.ellipse(float(x) + 14, by - 8, 22, 16, (66, 110, 62))
+
+        # 路边小花
+        for t in (0.34, 0.5, 0.66, 0.84):
+            y = horizon + (h - horizon) * t
+            half = far_half + (near_half - far_half) * t
+            for side in (-1, 1):
+                r.ellipse(cx + side * (half + 12), y, 2.2, 2.2,
+                          (226, 196, 84) if int(t * 100) % 2 else (228, 122, 112))
+
+        return np.asarray(r.data).copy()
 
     def render(self, *, state: dict | None = None, env: dict | None = None,
-               now: int | None = None, fps: int = 8) -> Raster:
+               now: int | None = None, dt: float = 0.125, fps: int = 8,
+               channel: str | None = None, name: str | None = None) -> Raster:
         state = state or {}
+        env = env or {}
         now = now if now is not None else int(time.time() * 1000)
         raster = Raster(self.width, self.height)
         w, h = self.width, self.height
-        raster.paste_array(self._background())
+
+        # 画面优先级：上传的人脸 > 摄像头/视频流实时帧 > 按天气选的场景底图
+        face_img = env.get("faceImage")
+        frame_img = env.get("frameImage")
+        face_mode = face_img is not None
+        live_mode = frame_img is not None and not face_mode
+        if face_mode:
+            raster.paste_array(np.asarray(face_img))
+        elif live_mode:
+            raster.paste_array(np.asarray(frame_img))
+        else:
+            raster.paste_array(self._background(env.get("sceneImage")))
+
+        # 按当地日照做光线处理：场景底图与摄像头实时帧都调色；
+        # 上传的人脸画面保持原色（保证识别框里的人脸清晰可辨）
+        grade = env.get("grade")
+        if not face_mode and grade and len(grade) == 4:
+            raster.color_grade((grade[0], grade[1], grade[2]), float(grade[3]))
 
         last_person = state.get("lastPerson")
         who = NAME_ASCII.get(last_person, "VISITOR") if last_person else None
         passed = state.get("lastResult") == "pass"
         rejected = state.get("lastResult") == "reject"
-        cx = w / 2
-        fy = h * 0.46
 
-        if who:
-            # 来人：画一个简笔人脸，让「识别」这件事看得见
-            skin = (214, 192, 162)
-            hair = (58, 44, 34)
-            raster.ellipse(cx, fy + 58, 62, 46, (48, 60, 64))        # 肩
-            raster.ellipse(cx, fy, 42, 52, skin)                      # 脸
-            raster.ellipse(cx, fy - 36, 44, 28, hair)                 # 头发
-            raster.fill_rect(cx - 46, fy - 32, 92, 12, hair)          # 刘海
-            raster.ellipse(cx - 15, fy - 2, 5.5, 5.5, (40, 38, 36))   # 眼
-            raster.ellipse(cx + 15, fy - 2, 5.5, 5.5, (40, 38, 36))
-            raster.fill_rect(cx - 11, fy + 24, 22, 3, (150, 96, 88))  # 嘴
-        else:
-            raster.ellipse(cx, fy, 42, 52, (30, 40, 40))              # 无人时的轮廓
-
-        # 识别框
         box = (125, 206, 160) if passed else (239, 111, 108) if rejected else (226, 177, 90)
-        bx, by, bw, bh = cx - 74, fy - 84, 148, 192
-        seg = 22
 
-        def corner(x: float, y: float, sx: int, sy: int) -> None:
-            raster.line(x, y, x + sx * seg, y, box, 3)
-            raster.line(x, y, x, y + sy * seg, box, 3)
+        # 人脸 / 实时帧：识别框 + 姓名。识别模型给了真实人脸框就按框画，
+        # 否则在画面中央画一个取景准星
+        cx = w / 2
+        if face_mode or live_mode:
+            real_box = env.get("faceBox")
+            if real_box and len(real_box) == 4:
+                bx, by, bw, bh = (float(v) for v in real_box)
+            else:
+                fy = h * 0.46
+                bx, by, bw, bh = cx - 74, fy - 84, 148, 192
+            seg = 22
 
-        corner(bx, by, 1, 1)
-        corner(bx + bw, by, -1, 1)
-        corner(bx, by + bh, 1, -1)
-        corner(bx + bw, by + bh, -1, -1)
+            def corner(x: float, y: float, sx: int, sy: int) -> None:
+                raster.line(x, y, x + sx * seg, y, box, 3)
+                raster.line(x, y, x, y + sy * seg, box, 3)
 
-        # 顶部与底部信息条
+            corner(bx, by, 1, 1)
+            corner(bx + bw, by, -1, 1)
+            corner(bx, by + bh, 1, -1)
+            corner(bx + bw, by + bh, -1, -1)
+            if who:
+                raster.text(who, cx - Raster.text_width(who, 2) / 2, by - 16, box, 2)
+
+        # 顶部 / 底部信息条（两种模式共用）
         bar_h = 26
         ink = (243, 239, 230)
         raster.fill_rect(0, 0, w, 22, (0, 0, 0), 0.45)
         raster.text(self.label, 8, 7, ink, 2)
         locked = bool(state.get("locked"))
         mid = "LOCKED" if locked else "UNLOCKED"
-        raster.text(mid, 8 + Raster.text_width(self.label, 2) + 14, 7,
+        mid_x = 8 + Raster.text_width(self.label, 2) + 14
+        raster.text(mid, mid_x, 7,
                     (239, 111, 108) if locked else (125, 206, 160), 2)
+        # 日照相位标签（DAWN / DAY / DUSK / NIGHT），夹在锁状态和时钟之间
+        phase_label = str(env.get("phaseLabel") or "").strip()
+        if phase_label:
+            raster.text(phase_label, mid_x + Raster.text_width(mid, 2) + 14, 7,
+                        (180, 210, 230), 2)
         stamp = clock_of(now)
         raster.text(stamp, w - Raster.text_width(stamp, 2) - 8, 7, ink, 2)
 
         raster.fill_rect(0, h - bar_h, w, bar_h, (0, 0, 0), 0.5)
         raster.text(f"CH {self.channel}", 8, h - bar_h + 8, ink, 2)
-        result = "FACE PASS" if passed else "FACE REJECT" if rejected else ("DETECTING" if who else "NO FACE")
+        face_detected = bool(env.get("faceDetected"))
+        if passed:
+            result = "FACE PASS"
+        elif rejected:
+            result = "FACE REJECT"
+        elif face_detected:
+            result = "FACE DETECTED"
+        elif face_mode or live_mode:
+            result = "SCANNING..."
+        else:
+            result = "NO FACE"
         raster.text(result, w - Raster.text_width(result, 2) - 8, h - bar_h + 8, box, 2)
-        if who:
-            raster.text(who, cx - Raster.text_width(who, 2) / 2, h - bar_h - 26, box, 2)
 
-        raster.noise(14, 5)
-        raster.vignette(0.55)
+        raster.noise(12 if (face_mode or live_mode) else 9, 5)
+        raster.vignette(0.55 if (face_mode or live_mode) else 0.42)
         return raster
 
 
@@ -372,7 +526,10 @@ class StandbySource:
         self.height = height
 
     def render(self, *, now: int | None = None, channel: str = "",
-               name: str = "", fps: int = 8) -> Raster:
+               name: str = "", fps: int = 8,
+               state: dict | None = None, env: dict | None = None,
+               dt: float = 0.0) -> Raster:
+        # state/env/dt 由统一帧循环传入；待机画面不关心设备状态，显式忽略
         now = now if now is not None else int(time.time() * 1000)
         raster = Raster(self.width, self.height)
         w, h = self.width, self.height

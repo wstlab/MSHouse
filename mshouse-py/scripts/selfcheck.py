@@ -172,38 +172,36 @@ async def main() -> int:
             lock = next((d for d in after_devices if d["id"] == "lock.entry"), None)
             ok("睡眠模式：大门上锁", bool(lock and lock["state"]["locked"] is True))
 
-            # 4. 人脸识别
-            face_t = asyncio.create_task(bus.wait_for(
+            # 4. 门锁远程控制：开锁 → 状态广播与事件；再上锁
+            unlock_t = asyncio.create_task(bus.wait_for(
                 "state", lambda m: (m.get("payload") or {}).get("deviceId") == "lock.entry"
-                and ((m.get("payload") or {}).get("state") or {}).get("lastResult") == "pass"))
-            evt_t = asyncio.create_task(bus.wait_for(
+                and ((m.get("payload") or {}).get("state") or {}).get("locked") is False))
+            unlock_evt = asyncio.create_task(bus.wait_for(
                 "event", lambda m: (m.get("payload") or {}).get("source") == "lock.entry"))
-            await send(envelope("command", {"deviceId": "lock.entry", "action": "face",
-                                            "params": {"faceId": "resident.lin"}}, id="cmd-face"))
-            face_state, evt = await asyncio.gather(face_t, evt_t)
-            fs = (face_state.get("payload") or {}).get("state") or {}
-            ok("住户人脸识别通过", fs.get("lastResult") == "pass", str(fs.get("lastPerson")))
-            ok("识别后自动开锁", fs.get("locked") is False)
-            ok("产生安防事件", (evt.get("payload") or {}).get("level") == "ok",
-               (evt.get("payload") or {}).get("message", ""))
+            await send(envelope("command", {"deviceId": "lock.entry", "action": "unlock",
+                                            "params": {}}, id="cmd-unlock"))
+            unlocked, unlock_event = await asyncio.gather(unlock_t, unlock_evt)
+            us = (unlocked.get("payload") or {}).get("state") or {}
+            ok("远程开锁生效", us.get("locked") is False)
+            ok("开锁产生事件", (unlock_event.get("payload") or {}).get("level") == "ok",
+               (unlock_event.get("payload") or {}).get("message", ""))
 
-            # 5. 先上锁，再让访客刷脸 —— 应被拒绝且门锁保持闭合
             relock_t = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-relock"))
+            relock_state = asyncio.create_task(bus.wait_for(
+                "state", lambda m: (m.get("payload") or {}).get("deviceId") == "lock.entry"
+                and ((m.get("payload") or {}).get("state") or {}).get("locked") is True))
             await send(envelope("command", {"deviceId": "lock.entry", "action": "lock", "params": {}},
                                 id="cmd-relock"))
             ok("远程上锁成功", ((await relock_t).get("payload") or {}).get("ok") is True)
+            ok("上锁状态已广播", (((await relock_state).get("payload") or {}).get("state") or {}).get("locked") is True)
 
-            reject_t = asyncio.create_task(bus.wait_for(
-                "state", lambda m: (m.get("payload") or {}).get("deviceId") == "lock.entry"
-                and ((m.get("payload") or {}).get("state") or {}).get("lastResult") == "reject"))
+            # 已下线的模拟人脸动作应被拒绝（人脸改由上传画面 / 实时摄像头识别驱动）
+            gone_face_t = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-face-gone"))
             await send(envelope("command", {"deviceId": "lock.entry", "action": "face",
-                                            "params": {"faceId": "guest.unknown"}}, id="cmd-face2"))
-            rejected = ((await reject_t).get("payload") or {}).get("state") or {}
-            ok("访客识别被拒且保持上锁",
-               rejected.get("lastResult") == "reject" and rejected.get("locked") is True,
-               str(rejected.get("lastPerson")))
+                                            "params": {"faceId": "resident.lin"}}, id="cmd-face-gone"))
+            ok("模拟人脸动作已移除", ((await gone_face_t).get("payload") or {}).get("ok") is False)
 
-            # 6. 云台控制
+            # 5. 云台控制
             pan_t = asyncio.create_task(bus.wait_for(
                 "state", lambda m: (m.get("payload") or {}).get("deviceId") == "camera.living"
                 and ((m.get("payload") or {}).get("state") or {}).get("pan") == 275))
@@ -212,7 +210,7 @@ async def main() -> int:
             pan_state = ((await pan_t).get("payload") or {}).get("state") or {}
             ok("云台角度可控", pan_state.get("pan") == 275)
 
-            # 7. 视频流：信令走 WebSocket，像素走独立的 HTTP 通道
+            # 6. 视频流：信令走 WebSocket，像素走独立的 HTTP 通道
             # 先回到关流状态 —— 信令只在状态「变化」时广播，上一轮残留 streaming=true 会导致本次不广播
             pre_off = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-cam-pre"))
             await send(envelope("command", {"deviceId": "camera.living", "action": "stream",
@@ -250,7 +248,7 @@ async def main() -> int:
             off_payload = (await cam_off).get("payload") or {}
             ok("stream off 生效", (off_payload.get("stream") or {}).get("live") is False)
 
-            # 8. 错误处理
+            # 7. 错误处理
             bad_device = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-bad"))
             await send(envelope("command", {"deviceId": "no.such.device", "action": "set", "params": {}},
                                 id="cmd-bad"))
@@ -268,18 +266,18 @@ async def main() -> int:
             ok("非法 JSON 被拦截",
                ((await bad_json_t).get("payload") or {}).get("code") == "BAD_JSON")
 
-            # 9. 心跳
+            # 8. 心跳
             pong_t = asyncio.create_task(bus.wait_for("pong"))
             await send(envelope("ping", {"at": 1}, id="cmd-ping"))
             ok("ping/pong 正常", ((await pong_t).get("payload") or {}).get("echo", {}).get("at") == 1)
 
-            # 10. 传感器只读
+            # 9. 传感器只读
             ro_t = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-ro"))
             await send(envelope("command", {"deviceId": "sensor.living", "action": "set",
                                             "params": {"temperature": 99}}, id="cmd-ro"))
             ok("传感器拒写（只读遥测）", ((await ro_t).get("payload") or {}).get("ok") is False)
 
-            # 11. 初始化设置：口令错误应拒绝，正确口令写入位置并改写室外温度
+            # 10. 初始化设置：口令错误应拒绝，正确口令写入位置并改写室外温度
             bad_setup = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-setup-bad"))
             await send(envelope("setup", {"password": "wrong", "lat": 30.27, "lon": 120.15, "name": "测试"},
                                 id="cmd-setup-bad"))
@@ -294,7 +292,8 @@ async def main() -> int:
             site = sp.get("site") or {}
             outdoor = sp.get("outdoor") or {}
             ok("正确口令写入经纬度",
-               (setup_done.get("payload") or {}).get("ok") is True and site.get("lat") == 30.3,
+               (setup_done.get("payload") or {}).get("ok") is True
+               and site.get("lat") == 30.2741 and site.get("lon") == 120.1551,
                f"{site.get('name')} {outdoor.get('temp')}°C")
             ok("室外温度来自预报而非默认值",
                outdoor.get("source") == "forecast" and isinstance(outdoor.get("temp"), (int, float))
