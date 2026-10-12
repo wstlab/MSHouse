@@ -6,9 +6,9 @@
  * 视频：WebSocket 只承载「流信令」（通道名 / 是否在推 / 云台角），
  *       像素由 /?stream=<通道> 这个 HTTP 长连接提供，两条通道互不干扰。
  */
-import { envelope, nextId } from "./protocol.js?v=17";
-import { MSHouseScene } from "./scene.js?v=17";
-import { Dashboard } from "./ui.js?v=17";
+import { envelope, nextId } from "./protocol.js?v=24";
+import { MSHouseScene } from "./scene.js?v=24";
+import { Dashboard } from "./ui.js?v=24";
 
 const OCCUPANCY = { home: "在家", away: "离家", sleep: "睡眠" };
 
@@ -81,6 +81,38 @@ scene.onSelect((id) => {
 let ws = null;
 let retry = 0;
 let manualClose = false;
+// 出站序号追踪：用于发现漏收的报文并触发重新同步
+let lastSeq = 0;
+let resyncPending = false;
+
+/**
+ * 取访问令牌。
+ *
+ * 优先 URL 参数 ?token=xxx（方便直接点链接进入），拿到后存进 localStorage
+ * 并从地址栏抹掉 —— 免得令牌留在浏览历史、截图、以及随手转发出去的链接里。
+ */
+function resolveToken() {
+  const DEFAULT_TOKEN = "quickform";
+  let fromUrl = "";
+  try {
+    const url = new URL(location.href);
+    fromUrl = url.searchParams.get("token") || "";
+    if (fromUrl) {
+      localStorage.setItem("mshouse.token", fromUrl);
+      url.searchParams.delete("token");
+      history.replaceState(null, "", url.toString());
+      return fromUrl;
+    }
+    // 默认令牌也写入 localStorage：视频流地址（ui.js streamSrc）等读取方
+    // 只认 localStorage，不写会导致 /?stream= 拼不出令牌而被 401 拒绝。
+    const saved = localStorage.getItem("mshouse.token");
+    if (saved) return saved;
+    localStorage.setItem("mshouse.token", DEFAULT_TOKEN);
+    return DEFAULT_TOKEN;
+  } catch {
+    return fromUrl || DEFAULT_TOKEN;
+  }
+}
 
 function send(msg) {
   const full = { ...msg, id: msg.id || nextId("ui") };
@@ -88,32 +120,85 @@ function send(msg) {
   if (ws?.readyState === 1) ws.send(JSON.stringify(full));
 }
 
+/** 不记入报文面板的发送（心跳回应这类高频报文不该刷屏）。 */
+function sendQuiet(msg) {
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ ...msg, id: nextId("hb") }));
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
+  const token = resolveToken();
   ui.setConnection(false, retry ? `重连中 (${retry})` : "连接中");
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // 浏览器不允许给 WebSocket 加自定义请求头，子协议是唯一能携带凭据的地方。
+  // 这也是 v2.0 要求客户端配合改动的唯一一处。
+  const protocols = token ? ["mshouse.v1", `bearer.${token}`] : ["mshouse.v1"];
+  const socket = new WebSocket(`${proto}://${location.host}/ws`, protocols);
+  ws = socket;
 
-  ws.onopen = () => {
+  socket.onopen = () => {
+    if (ws !== socket) return;         // 已被更新的连接取代
     retry = 0;
+    lastSeq = 0;
+    resyncPending = false;
     ui.setConnection(true, "已连接");
     ui.toast("已接入别墅网关");
   };
 
-  ws.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (ws !== socket) return;
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
     ui.addWire("in", msg);
     handle(msg);
   };
 
-  ws.onclose = () => {
-    ui.setConnection(false, "已断开");
+  socket.onclose = (ev) => {
+    if (ws !== socket) return;         // 旧 socket 的关闭事件，忽略
+    const reason = ev?.code === 4401 ? "令牌无效"
+      : ev?.code === 4426 ? "协议版本不匹配"
+      : ev?.code === 4408 ? "心跳超时"
+      : "已断开";
+    ui.setConnection(false, reason);
     if (manualClose) return;
+    if (ev?.code === 4401 || ev?.code === 4426) {
+      // 令牌不对 / 版本不匹配：重连只会刷屏，提示用户去改
+      ui.toast(ev.code === 4401
+        ? "认证失败：点右上角「连接」填入访问令牌（令牌见服务端启动日志）"
+        : "协议版本不匹配：请更新页面或网关");
+      return;
+    }
     retry += 1;
     setTimeout(connect, Math.min(6000, 800 + retry * 900));
   };
 
-  ws.onerror = () => ui.setConnection(false, "连接异常");
+  socket.onerror = () => { if (ws === socket) ui.setConnection(false, "连接异常"); };
+}
+
+/** 主动断开并立即用新凭据重连（令牌变更后调用）。 */
+function reconnect() {
+  manualClose = true;
+  try { ws?.close(); } catch { /* 忽略 */ }
+  manualClose = false;
+  retry = 0;
+  connect();
+}
+
+/**
+ * 序号连续性检查。
+ *
+ * 服务端为每条状态报文编号（按连接独立）。发现跳号说明中间有报文
+ * 在背压时被丢弃了 —— 这时不猜「丢了什么」，直接请求一次全量对齐。
+ * 增量重放需要服务端保存全部历史，代价比一次全量快照大得多。
+ */
+function noteSeq(payload) {
+  const seq = payload?.seq;
+  if (typeof seq !== "number") return;
+  if (lastSeq && seq > lastSeq + 1 && !resyncPending) {
+    resyncPending = true;
+    ui.toast(`检测到 ${seq - lastSeq - 1} 条报文丢失，正在重新同步…`);
+    send(envelope("resync", { since: lastSeq }));
+  }
+  lastSeq = Math.max(lastSeq, seq);
 }
 
 /* ---------------- 消息分发 ---------------- */
@@ -121,11 +206,15 @@ function handle(msg) {
   switch (msg.type) {
     case "hello":
       ui.toast(`网关握手成功 · ${msg.payload?.protocol || ""}`);
+      if (msg.payload?.authRequired && msg.payload?.authed === false) {
+        ui.toast("网关要求认证：请在地址后加 ?token=<访问令牌>");
+      }
       break;
     case "snapshot":
       applySnapshot(msg.payload);
       break;
     case "state":
+      noteSeq(msg.payload);
       applyDeviceState(msg.payload);
       break;
     case "scene":
@@ -138,6 +227,28 @@ function handle(msg) {
     case "event":
       ui.addEvent(msg.payload);
       if (msg.payload.level === "alarm") ui.toast("⚠ " + msg.payload.message);
+      break;
+    case "fault":
+      ui.addEvent({
+        level: msg.payload?.severity || "warn",
+        source: msg.payload?.deviceId,
+        message: `故障：${msg.payload?.message || msg.payload?.faultCode}`,
+        ts: msg.ts,
+      });
+      ui.toast(`⚠ ${msg.payload?.deviceId}：${msg.payload?.message}`);
+      break;
+    case "ota": {
+      const p = msg.payload || {};
+      const pct = Math.round((p.progress || 0) * 100);
+      ui.toast(`固件升级 ${p.state} ${pct}%`);
+      break;
+    }
+    case "ping":
+      // 服务端心跳。必须回应：连续 3 次不回会被判定失联并断开连接，
+      // 那样流通道也会跟着被释放。
+      sendQuiet(envelope("pong", { at: Date.now() }));
+      break;
+    case "pong":
       break;
     case "video":
       applyVideoSignal(msg.payload);
@@ -162,23 +273,39 @@ function handle(msg) {
     case "ack":
       if (pendingAuthAcks.has(msg.id)) {
         pendingAuthAcks.delete(msg.id);
-        ui.setupAuthResult(msg.payload?.ok !== false, msg.payload?.error);
+        ui.setupAuthResult(msg.payload?.ok !== false, errorText(msg.payload));
         break;
       }
       if (msg.payload && msg.payload.ok === false) {
-        if (/口令|经纬|天气|预报|来源|流地址|摄像头序号|留空/.test(msg.payload.error || "")) {
-          ui.setSetupBusy(false, msg.payload.error);
+        const code = msg.payload.errorInfo?.code;
+        const text = errorText(msg.payload);
+        if (code === "RATE_LIMITED") {
+          ui.toast("操作过于频繁，请稍候再试");
+        } else if (/口令|经纬|天气|预报|来源|流地址|摄像头序号|留空/.test(text)) {
+          ui.setSetupBusy(false, text);
         } else if (msg.payload.action === "enrollFace") {
-          ui.enrollFailed(msg.payload.error);
+          ui.enrollFailed(text);
+        } else {
+          ui.toast(`${msg.payload.deviceId || "设备"}：${text}`);
         }
       }
       break;
-    case "error":
-      ui.toast(`网关错误：${msg.payload?.message || msg.payload?.code}`);
+    case "error": {
+      const p = msg.payload || {};
+      ui.toast(`网关错误：${p.message || p.code}`);
+      if (p.code === "UNAUTHORIZED") {
+        ui.setConnection(false, "未认证");
+      }
       break;
+    }
     default:
       break;
   }
+}
+
+/** 取错误文案：优先结构化的 errorInfo，回落到过渡期的 error 字符串。 */
+function errorText(payload) {
+  return payload?.errorInfo?.message || payload?.error || "";
 }
 
 function applySnapshot(snap) {
@@ -187,6 +314,8 @@ function applySnapshot(snap) {
   state.occupancy = snap.occupancy;
   state.devices.clear();
   for (const d of snap.devices) state.devices.set(d.id, d);
+  // 全量快照到手，序号基准重置 —— 重新同步完成
+  resyncPending = false;
 
   ui.renderScenes(snap.scenes, snap.scene);
   ui.renderDevices(snap.devices);
@@ -212,11 +341,29 @@ function applySnapshot(snap) {
   }
 }
 
+/**
+ * 应用一条状态报文。
+ *
+ * v2.0 起服务端默认只发「变化的字段」（stateKind = delta），
+ * 所以这里必须先与本地状态**合并**再交给界面 ——
+ * 直接覆盖会把这次没变化的字段全部抹成 undefined。
+ */
 function applyDeviceState(payload) {
   const d = state.devices.get(payload.deviceId);
-  if (d) d.state = payload.state;
-  scene.applyDeviceState(payload);
-  ui.updateDevice(payload.deviceId, payload.state, d);
+  const kind = payload.stateKind || "full";
+  let merged = payload.state;
+  if (d) {
+    // delta（中间值）与 confirmed（两阶段提交落地）都只携带变化字段，需合并；
+    // 只有 full（快照）才是完整状态、直接覆盖。
+    merged = kind === "full"
+      ? { ...(payload.state || {}) }
+      : { ...(d.state || {}), ...(payload.state || {}) };
+    d.state = merged;
+    if (payload.derived) d.derived = payload.derived;
+    if (typeof payload.online === "boolean") d.online = payload.online;
+  }
+  scene.applyDeviceState({ ...payload, state: merged });
+  ui.updateDevice(payload.deviceId, merged, d, payload.derived);
 }
 
 /* ---------------- 画面（HTTP 流） ---------------- */
@@ -327,6 +474,25 @@ window.addEventListener("keydown", (e) => {
     document.querySelectorAll(".floor-switch .chip").forEach((b) => b.classList.toggle("on", b.dataset.floor === next));
     scene.setFloor(next);
   }
+});
+
+/* ---------------- 连接设置（v2.0：/ws 需要访问令牌） ---------------- */
+
+const connDialog = document.getElementById("connDialog");
+const connToken = document.getElementById("connToken");
+
+document.getElementById("connBtn")?.addEventListener("click", () => {
+  if (connToken) connToken.value = localStorage.getItem("mshouse.token") || "";
+  connDialog?.showModal?.();
+});
+document.getElementById("connCancel")?.addEventListener("click", () => connDialog?.close?.());
+document.getElementById("connForm")?.addEventListener("submit", () => {
+  const value = connToken?.value.trim() || "";
+  if (value) localStorage.setItem("mshouse.token", value);
+  else localStorage.removeItem("mshouse.token");
+  connDialog?.close?.();
+  reconnect();
+  ui.toast(value ? "令牌已保存，正在重连…" : "令牌已清除，以匿名方式重连…");
 });
 
 /* ---------------- 启动 ---------------- */

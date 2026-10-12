@@ -17,16 +17,25 @@ function el(tag, className, text) {
  * 拼一路视频流的地址：
  *   配置了独立推流端口 → http://当前主机:端口/（和真实 IP 摄像头一致）；
  *   否则复用主端口     → /?stream=<通道号>（相对地址，跟页面同源）。
+ *
+ * v2.0 起像素通道也受鉴权保护，而 <img> 没法带请求头 —— 所以把令牌拼在查询串上。
+ * 服务端同时支持 ?token= 与一次性签名地址（/?stream=x&exp=&sig=，由 /api/stream-url 签发）；
+ * 页面内嵌用令牌即可，要贴给别人看（外链、iframe）请改用签名地址，见 docs/INTEGRATION.md 第八节。
  */
 export function streamSrc(info) {
-  if (info?.port) return `http://${location.hostname}:${info.port}/`;
-  return `/?stream=${info.channel}`;
+  const token = localStorage.getItem("mshouse.token") || "";
+  const q = token ? `?token=${encodeURIComponent(token)}` : "";
+  if (info?.port) return `http://${location.hostname}:${info.port}/${q}`;
+  return `/?stream=${info.channel}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
 }
 
 const TYPE_LABEL = { light: "灯光", sensor: "传感器", ac: "空调", camera: "摄像头", lock: "门锁" };
 const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bath: "卫生间", entry: "门厅" };
 const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
 const FAN_LABEL = { low: "低风", mid: "中风", high: "高风", auto: "自动" };
+// 派生量的中文映射放在前端：服务端只发机器可读枚举（cool/comfortable/...），
+// 这样换语言不用动服务端，也避免把中文语义写进协议。
+const COMFORT_LABEL = { cool: "偏凉", comfortable: "舒适", warm: "偏热", hot: "闷热" };
 
 export class Dashboard {
   constructor(handlers) {
@@ -172,7 +181,9 @@ export class Dashboard {
   }
 
   /* ---------------- 顶部状态 ---------------- */
+  _wsConnected = false;
   setConnection(ok, text) {
+    this._wsConnected = ok;
     const dot = $("#linkDot");
     dot?.classList.toggle("ok", ok);
     dot?.classList.toggle("warn", !ok);
@@ -318,6 +329,7 @@ export class Dashboard {
   _verifyPassword() {
     const password = $("#setupPassword")?.value || "";
     if (!password) { this.setAuthBusy(false, "请输入初始化口令"); return; }
+    if (!this._wsConnected) { this.setAuthBusy(false, "请先点右上角「连接」填入访问令牌，再设置"); return; }
     this.setAuthBusy(true);
     this.h.setupAuth?.(password);
   }
@@ -493,10 +505,15 @@ export class Dashboard {
       hh.style.fontSize = "20px";
       big.append(t, hh, c);
       ctrl.appendChild(big);
-      api.sync = (s) => {
+      api.sync = (s, derived) => {
         t.textContent = `${(s.temperature ?? 0).toFixed(1)}°C`;
         hh.textContent = `${Math.round(s.humidity ?? 0)}%`;
-        c.textContent = s.comfort || "";
+        // 舒适度来自 derived 命名空间（应用层派生量），不是设备上报的字段
+        const label = COMFORT_LABEL[derived?.comfort] || "";
+        const thi = derived?.thi != null ? `THI ${derived.thi}` : "";
+        const batt = s.battery != null ? `电量 ${Math.round(s.battery)}%` : "";
+        const sig = s.rssi != null ? `${s.rssi} dBm` : "";
+        c.textContent = [label, thi, batt, sig].filter(Boolean).join(" · ");
       };
     } else if (d.type === "ac") {
       const btn = el("button", "primary", "开空调");
@@ -625,22 +642,28 @@ export class Dashboard {
     return card;
   }
 
-  updateDevice(id, state, meta) {
+  updateDevice(id, state, meta, derived) {
     const card = this.cards.get(id);
-    if (card) card.sync(state);
+    if (card) card.sync(state, derived, meta);
     const row = this.statusRows.get(id);
     if (row) {
       const d = meta || this.deviceIndex.get(id) || {};
-      row.textContent = this._summary(d.type, state);
+      // 离线设备必须显式标注：否则界面会一直显示一个「最后已知状态」，
+      // 而使用者以为那是实时的 —— 这正是旧版 online 恒为 true 的后果。
+      const offline = d && d.online === false;
+      row.textContent = offline
+        ? `离线（最后已知：${this._summary(d.type, state, derived || d.derived)}）`
+        : this._summary(d.type, state, derived || d.derived);
     }
   }
 
-  _summary(type, s) {
+  _summary(type, s, derived) {
     switch (type) {
       case "light": return s.power ? `开 · ${Math.round(s.brightness)}% · ${Math.round(s.colorTemp)}K` : "关";
-      case "sensor": return `${(s.temperature ?? 0).toFixed(1)}°C · ${Math.round(s.humidity ?? 0)}% · ${s.comfort ?? ""}`;
+      case "sensor": return `${(s.temperature ?? 0).toFixed(1)}°C · ${Math.round(s.humidity ?? 0)}%`
+        + (derived?.comfort ? ` · ${COMFORT_LABEL[derived.comfort] || ""}` : "");
       case "ac": return s.power ? `${MODE_LABEL[s.mode] || s.mode} · ${s.targetTemp}°C · ${FAN_LABEL[s.fan] || s.fan}` : "关";
-      case "camera": return `${s.power ? "在线" : "离线"} · PAN ${Math.round(s.pan ?? 0)}°${s.armed ? " · 布防" : ""}`;
+      case "camera": return `${s.power ? "在线" : "离线"} · PAN ${Math.round(s.pan ?? 0)}°${s.armed ? " · 布防" : ""}${s.motion ? " · 移动" : ""}`;
       case "lock": return `${s.locked ? "已上锁" : "已开锁"} · ${s.lastResult === "pass" ? "人脸通过" : s.lastResult === "reject" ? "人脸拒绝" : "待机"}`;
       default: return "—";
     }

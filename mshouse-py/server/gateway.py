@@ -34,17 +34,33 @@ from zoneinfo import ZoneInfo
 import httpx
 from PIL import Image
 
+from . import derived, security, validate
 from .media import VideoSource
 from .model import (
+    BATTERY,
     DEVICE_CATALOG,
+    ERROR_CODES,
+    FAULT_CODES,
+    FAULT_LABELS,
     GATEWAY_NAME,
     GATEWAY_PROTOCOL,
+    MOTION_HOLD_SECONDS,
+    MOTION_MEAN_INTERVAL,
+    MSG,
+    OUTDOOR_REPORTING,
+    PAN,
+    PROTOCOL_VERSION,
+    REPORTING,
     SCENES,
-    SETUP_PASSWORD,
+    STATE_KIND,
+    TELEMETRY_SAMPLE_INTERVAL,
     DeviceSpec,
+    behavior_for,
     device_by_id,
     envelope,
     now_ms,
+    quantize,
+    reporting_for,
 )
 from .render.scenes import EntrySource, LivingRoomSource, StandbySource, _cover_crop
 from .stream import StreamHub
@@ -52,6 +68,19 @@ from .vision import FaceMatcher
 
 # 内置识别通过时显示的人名（与登记照片 camera/face.jpg 对应）
 LOCK_RESIDENT_NAME = "登记住户"
+
+# 未认证连接允许存活的宽限期（秒）：连上后必须在这段时间内完成认证。
+# 没有这条，任何人都能靠占位连接把网关的连接数吃满。
+AUTH_GRACE_SECONDS = 5.0
+
+# 服务端心跳：每 HEARTBEAT_INTERVAL 秒下发一次 ping，
+# 连续 HEARTBEAT_MAX_MISSES 次没收到 pong 就判定客户端失联。
+# 真实 IoT 平台靠这个清理僵尸连接，否则流通道会被死连接一直占着。
+HEARTBEAT_INTERVAL = 20.0
+HEARTBEAT_MAX_MISSES = 3
+
+# 出站队列上限
+OUTBOX_MAXSIZE = 256
 
 # 陌生人脸登记提示的去抖参数：
 #   连续 N 次识别到未登记人脸才弹一次询问；人脸消失 N 次后结束本轮；提示最长保留秒数
@@ -155,44 +184,167 @@ class Device:
     floor: int
     capabilities: tuple[str, ...]
     channel: str | None
-    state: dict[str, Any] = field(default_factory=dict)
+    # reported：设备实际上报的状态（真实值）。v2.0 起改名为 reported，
+    # 因为「设备当前是什么状态」与「我们希望它是什么状态」是两件事，
+    # 混用一个 state 字段就没法表达「命令已下发、设备还没执行完」。
+    reported: dict[str, Any] = field(default_factory=dict)
+    # desired：应用下发的期望状态（待设备执行）。与 reported 的差集就是 delta。
+    desired: dict[str, Any] = field(default_factory=dict)
     online: bool = True
     updated_at: int = 0
+    # —— 链路状态 ——
+    last_seen_at: int = 0
+    missed_heartbeats: int = 0
+    # 上次主动探测该设备的时间（离线判定用）
+    last_probe_at: int = 0
+    # 字段 → 上次上报的值 / 时间戳（变化上报判定用，不对外暴露）
+    last_reported: dict[str, Any] = field(default_factory=dict)
+    last_report_ts: dict[str, int] = field(default_factory=dict)
+    # 待执行命令的定时器（模拟设备执行延迟）
+    pending: list[asyncio.Task] = field(default_factory=list)
+    # 当前故障：{故障码: {severity, message, since}}
+    faults: dict[str, dict[str, Any]] = field(default_factory=dict)
+    firmware: str = "1.0.0"
+    # 环境量的缓慢漂移分量（开窗、人数变化这类慢过程）。
+    # 单独存一份是为了让「真实值」与「上报值」分开：
+    # 上报值 = 真实值 + 远小于上报阈值的测量噪声。
+    drift: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def state(self) -> dict[str, Any]:
+        """
+        兼容别名。
+
+        v2.0 起 state 的正式名称是 reported。保留这个 property 是为了让
+        渲染层、流信令等大量既有调用点不用全改，同时语义上明确
+        「读到的是设备上报值」。新代码请直接写 reported。
+        """
+        return self.reported
 
     @classmethod
-    def from_spec(cls, spec: DeviceSpec, state: dict[str, Any]) -> "Device":
+    def from_spec(cls, spec: DeviceSpec, reported: dict[str, Any]) -> "Device":
         return cls(
             id=spec.id, type=spec.type, name=spec.name, room=spec.room,
             floor=spec.floor, capabilities=spec.capabilities, channel=spec.channel,
-            state=state, updated_at=now_ms(),
+            reported=reported, updated_at=now_ms(), last_seen_at=now_ms(),
         )
+
+    def behavior(self) -> dict[str, Any]:
+        return behavior_for(self.type)
+
+    def delta(self) -> dict[str, Any]:
+        """desired 与 reported 的差集。空字典表示设备已达成期望状态。"""
+        return {k: v for k, v in self.desired.items() if self.reported.get(k) != v}
+
+    def seed_reported(self) -> None:
+        """把当前 reported 记为「已上报」，避免启动瞬间把所有字段当成变化量广播。"""
+        self.last_reported = dict(self.reported)
+        stamp = now_ms()
+        self.last_report_ts = {k: stamp for k in self.reported}
 
 
 class Client:
     """一个 WebSocket 连接。出站报文走队列，避免同步逻辑被迫 async 化。"""
 
-    __slots__ = ("ws", "outbox", "pump")
+    __slots__ = (
+        "ws", "outbox", "pump", "authed", "auth_deadline", "out_seq",
+        "rate_tokens", "rate_ts", "last_pong", "dropped", "coalesced",
+        "pending_state", "resync_needed",
+    )
 
     def __init__(self, ws: Any) -> None:
         self.ws = ws
-        self.outbox: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self.outbox: asyncio.Queue[str] = asyncio.Queue(maxsize=OUTBOX_MAXSIZE)
         self.pump: asyncio.Task | None = None
+        # 认证状态：连上不等于能用，必须先过令牌校验
+        self.authed = False
+        self.auth_deadline = time.monotonic() + AUTH_GRACE_SECONDS
+        # 出站序号：客户端发现跳号时可请求 resync
+        self.out_seq = 0
+        # 命令限流（令牌桶）。初值 None 表示「尚未初始化」，
+        # 首次调用时才按速率填满 —— 见 take_token 的说明。
+        self.rate_tokens: float | None = None
+        self.rate_ts = time.monotonic()
+        # 心跳
+        self.last_pong = time.monotonic()
+        # 统计（供 /health 观察背压）
+        self.dropped = 0
+        self.coalesced = 0
+        # 同设备同类报文的合并缓存：key → 最新一条报文
+        self.pending_state: dict[str, str] = {}
+        self.resync_needed = False
 
-    def push(self, data: str) -> None:
-        """非阻塞投递。队列满了就丢最旧的一条，保证慢客户端不拖累网关。"""
+    def next_seq(self) -> int:
+        self.out_seq += 1
+        return self.out_seq
+
+    def take_token(self, rate: float, burst: float | None = None) -> bool:
+        """
+        令牌桶限流。返回 False 表示应当拒绝本次请求。
+
+        桶容量默认等于速率，即允许 1 秒的突发 —— 突发一小批命令是正常操作
+        （比如场景切换会连发好几条），但持续高速刷命令不是。
+
+        首次调用时把桶填满：否则连接刚建立的那一瞬间几乎什么都发不出去，
+        那是限流的 bug，不是限流的效果。
+        """
+        now = time.monotonic()
+        capacity = burst if burst is not None else rate
+        if self.rate_tokens is None:
+            self.rate_tokens = capacity
+            self.rate_ts = now
+        self.rate_tokens = min(capacity, self.rate_tokens + (now - self.rate_ts) * rate)
+        self.rate_ts = now
+        if self.rate_tokens >= 1.0:
+            self.rate_tokens -= 1.0
+            return True
+        return False
+
+    def push(self, data: str, *, coalesce_key: str | None = None) -> None:
+        """
+        非阻塞投递。
+
+        与旧版的区别：队列满时**不再静默丢弃最旧报文**。静默丢包会让慢客户端
+        的状态永久停在某个旧值上，而且它自己不知道 —— 排查这类问题非常痛苦。
+        现在的策略是：
+          ① 同类报文（同一设备的 state）先做合并，只保留最新值；
+          ② 仍然放不下就标记 resync_needed，由心跳周期通知客户端全量对齐。
+        """
+        if coalesce_key is not None:
+            # 若队列里已有同 key 的报文，就地替换（先出后进，保证顺序不变）
+            previous = self.pending_state.get(coalesce_key)
+            if previous is not None:
+                try:
+                    self.outbox.put_nowait(data)
+                    self.coalesced += 1
+                    self.pending_state[coalesce_key] = data
+                    return
+                except asyncio.QueueFull:
+                    pass
+            self.pending_state[coalesce_key] = data
+
         try:
             self.outbox.put_nowait(data)
             return
         except asyncio.QueueFull:
             pass
+
+        # 队列满：合并失败，退化为「丢最旧 + 请求 resync」
         try:
             self.outbox.get_nowait()
+            self.dropped += 1
+            self.resync_needed = True
         except asyncio.QueueEmpty:
             pass
         try:
             self.outbox.put_nowait(data)
         except asyncio.QueueFull:
-            pass
+            self.dropped += 1
+            self.resync_needed = True
+
+    def drain_coalesced(self) -> None:
+        """报文真正写出后清理合并缓存（由发送协程调用）。"""
+        self.pending_state.clear()
 
     async def run(self) -> None:
         """发送协程：把队列里的报文写进 WebSocket。"""
@@ -205,12 +357,38 @@ class Gateway:
     def __init__(self, stream_ports: dict[str, int] | None = None,
                  stream_images: dict[str, str] | None = None,
                  stream_fps: dict[str, int] | None = None,
-                 lock_options: dict[str, Any] | None = None) -> None:
+                 lock_options: dict[str, Any] | None = None,
+                 security_config: Any = None,
+                 device_config: Any = None) -> None:
         self.clients: set[Client] = set()
+        # —— 鉴权与仿真配置（v2.0）——
+        self.security_config = security_config
+        self.device_config = device_config
+        self.token: str = str(getattr(security_config, "token", "") or "")
+        self.allow_anonymous: bool = bool(getattr(security_config, "allow_anonymous", False))
+        self.setup_password_hash: str = str(
+            getattr(security_config, "setup_password_hash", "") or "")
+        self.command_rate_limit: float = float(
+            getattr(device_config, "command_rate_limit", 10.0) or 10.0)
+        # 同设备同字段的抖动合并窗口（毫秒）：连续拖动亮度滑块时
+        # 只有最后一次会被真正执行，避免把 30 条中间值全打到设备上
+        self.coalesce_window_ms: int = int(
+            getattr(device_config, "coalesce_window_ms", 200) or 0)
+        # 待合并的写指令：device_id → {"patch": {...}, "handle": Task}
+        self._coalesce_pending: dict[str, dict[str, Any]] = {}
+        # 配置里声明「保持离线」的设备（演示在线检测用）
+        self._simulated_offline: set[str] = set(
+            getattr(device_config, "simulate_offline", ()) or ())
+        # 最近一次执行的命令时间（限流统计用）
+        self._rate_limited = 0
+        self._commands_total = 0
         # 默认「回家模式」：每次首页访问前端也会重新下发一次 home 场景
         self.scene = "home"
         self.occupancy = "home"
         self.outdoor: dict[str, Any] = {"temp": 28.4, "humidity": 62, "source": "default"}
+        # 室外量的变化上报状态
+        self._outdoor_reported: dict[str, Any] = dict(self.outdoor)
+        self._outdoor_report_ts: dict[str, int] = {}
         self.site: dict[str, Any] = {
             "configured": False,
             "name": DEFAULT_SITE_NAME,
@@ -222,7 +400,10 @@ class Gateway:
         self.events: list[dict[str, Any]] = []
         self.devices: dict[str, Device] = {}
         self._last_signal: dict[str, str] = {}
-        self.hub = StreamHub(fps=8, quality=72)
+        self.hub = StreamHub(
+            fps=8, quality=72,
+            allowed_origins=tuple(getattr(security_config, "allowed_origins", ()) or ()),
+        )
         self._tasks: list[asyncio.Task] = []
         self._http: httpx.AsyncClient | None = None
         # 通道号 → 独立推流端口（来自 config.toml，空表示全部复用主端口）
@@ -272,21 +453,117 @@ class Gateway:
 
     async def start(self) -> None:
         """启动周期任务。必须在事件循环里调用。"""
-        self._http = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "mshouse/1.0 (teaching)"})
+        self._http = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "mshouse/2.0 (teaching)"})
+        self._restore_state()
+        self._apply_simulated_conditions()
         self._tasks.append(asyncio.create_task(self._loop_telemetry()))
         self._tasks.append(asyncio.create_task(self._loop_video_signal()))
         self._tasks.append(asyncio.create_task(self._loop_lock_vision()))
+        self._tasks.append(asyncio.create_task(self._loop_heartbeat()))
+        self._tasks.append(asyncio.create_task(self._loop_persistence()))
         print(f"[lock] 人脸模型：{self.face_matcher.reason}，阈值 {self.face_matcher.threshold}")
 
     async def dispose(self) -> None:
+        self._save_state()
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
+        for dev in self.devices.values():
+            for t in dev.pending:
+                t.cancel()
+            dev.pending.clear()
         self.hub.dispose()
         self.video_source.close(timeout=2.0)
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+    # ---------------- 状态持久化与仿真注入 ----------------
+
+    def _state_file(self) -> str | None:
+        rel = getattr(self.device_config, "state_persist", None)
+        if not rel:
+            return None
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return rel if os.path.isabs(rel) else os.path.join(root, rel)
+
+    def _restore_state(self) -> None:
+        """
+        从磁盘恢复设备上报值。
+
+        真实网关重启后设备状态是「问出来的」——重新向设备查询一次。
+        这里没有物理设备，所以退而求其次：把上次的 reported 存盘再读回。
+        注意只恢复 reported，不恢复 desired —— 重启后应当重新对账，
+        而不是把上次没执行完的期望当成既成事实。
+        """
+        path = self._state_file()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except Exception as err:
+            print(f"[gateway] 状态恢复失败（忽略）：{err!r}")
+            return
+        restored = 0
+        for dev_id, values in (saved.get("devices") or {}).items():
+            dev = self.devices.get(dev_id)
+            if dev is None or not isinstance(values, dict):
+                continue
+            for key, value in values.items():
+                if key in dev.reported:
+                    dev.reported[key] = value
+            dev.seed_reported()
+            restored += 1
+        if restored:
+            print(f"[gateway] 已从 {path} 恢复 {restored} 台设备的上报状态")
+
+    def _save_state(self) -> None:
+        path = self._state_file()
+        if not path:
+            return
+        try:
+            payload = {
+                "savedAt": now_ms(),
+                "devices": {d.id: d.reported for d in self.devices.values()},
+            }
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as err:
+            print(f"[gateway] 状态保存失败（忽略）：{err!r}")
+
+    async def _loop_persistence(self) -> None:
+        """周期落盘。真实网关也有类似的「定期把影子刷到存储」的动作。"""
+        if not self._state_file():
+            return
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                self._save_state()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                print(f"[gateway] 状态落盘任务异常：{err!r}")
+
+    def _apply_simulated_conditions(self) -> None:
+        """应用配置里的仿真条件：指定设备离线、注入故障。"""
+        for dev_id in getattr(self.device_config, "simulate_offline", ()) or ():
+            dev = self.devices.get(dev_id)
+            if dev is None:
+                print(f"[gateway] 警告：simulate_offline 里的 {dev_id} 不存在")
+                continue
+            dev.online = False
+            dev.missed_heartbeats = 99
+            print(f"[gateway] 仿真：{dev_id} 保持离线")
+
+        faults = getattr(self.device_config, "simulate_fault", None) or {}
+        for dev_id, code in faults.items():
+            dev = self.devices.get(dev_id)
+            if dev is None:
+                print(f"[gateway] 警告：simulate_fault 里的 {dev_id} 不存在")
+                continue
+            self.raise_fault(dev_id, code)
 
     # ---------------- 初始化 ----------------
 
@@ -417,16 +694,29 @@ class Gateway:
         for spec in DEVICE_CATALOG:
             self.devices[spec.id] = Device.from_spec(spec, self._default_state(spec))
         self._apply_scene("home", silent=True, source="boot")
+        # 用室外模型把室内初值摆到「稳态」附近。
+        # 没有这一步，`_default_state` 里的 25.2°C 会和实际目标值差好几度，
+        # 传感器会花好几分钟缓慢爬过去 —— 而这段时间它每 10 秒就上报一次，
+        # 看起来像「上报没生效」。真实设备出厂标定过，不会有这种长瞬态。
+        self._seed_indoor_from_outdoor()
+        # 启动瞬间把当前值记为「已上报」。
+        # 没有这一步，第一个遥测周期会把所有字段都当成「变化」全量推一遍 ——
+        # 而设备刚上电时本来就该安静。
+        for dev in self.devices.values():
+            dev.seed_reported()
 
     @staticmethod
     def _default_state(spec: DeviceSpec) -> dict[str, Any]:
         if spec.type == "light":
             return {"power": False, "brightness": 0, "colorTemp": 4000}
         if spec.type == "sensor":
+            # v2.0：不再有 comfort 字段 —— 那是应用层派生量，已移到 derived 命名空间。
+            # battery / rssi 是真实无线传感器必然会上报的器件状态。
             return {
                 "temperature": 26.8 if spec.room == "kitchen" else 25.2,
                 "humidity": 58 if spec.room == "bath" else 48,
-                "comfort": "舒适",
+                "battery": 92,
+                "rssi": -52,
             }
         if spec.type == "ac":
             return {"power": False, "mode": "cool", "targetTemp": 26, "fan": "auto", "indoorTemp": 27.5}
@@ -436,18 +726,35 @@ class Gateway:
         if spec.type == "lock":
             # facePresent：镜头前是否有人脸画面（由上传接口驱动，画面从草坪道路切到人脸）
             return {"locked": True, "lastPerson": None, "lastResult": "idle",
-                    "streaming": False, "battery": 86, "facePresent": False}
+                    "streaming": False, "battery": 86, "facePresent": False, "rssi": -61}
         return {}
 
     # ---------------- 连接管理 ----------------
 
     def attach(self, client: Client) -> None:
+        """
+        接入一个连接。
+
+        注意这里不再无条件下发快照：未认证的连接只收到一条 hello
+        （内含 authRequired 标记），必须先完成令牌校验才能看到设备影子。
+        否则任何人连上来就能读全屋设备状态 —— 这本身就是信息泄漏。
+        """
         self.clients.add(client)
         client.push(json_dumps(envelope("hello", {
             "role": "gateway",
             "name": GATEWAY_NAME,
             "protocol": GATEWAY_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "authRequired": not self.allow_anonymous,
+            "authed": client.authed,
+            "heartbeatInterval": HEARTBEAT_INTERVAL,
         })))
+        if not client.authed:
+            return
+        self._push_authed_greeting(client)
+
+    def _push_authed_greeting(self, client: Client) -> None:
+        """认证通过后的欢迎流程：下发全量影子 + 一条事件。"""
         self.push_snapshot(client)
         self._push_event(client, {
             "level": "info",
@@ -467,15 +774,45 @@ class Gateway:
         try:
             msg = json.loads(raw)
         except Exception:
-            self._send(client, envelope("error", {"code": "BAD_JSON", "message": "报文不是合法 JSON"}))
+            self._send_error(client, ERROR_CODES.BAD_JSON, "报文不是合法 JSON")
             return
         if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
-            self._send(client, envelope("error", {"code": "BAD_ENVELOPE", "message": "缺少 type 字段"}))
+            self._send_error(client, ERROR_CODES.BAD_ENVELOPE, "缺少 type 字段")
             return
 
         msg_type = msg["type"]
         msg_id = msg.get("id") or f"srv-{self.seq}"
         self.seq += 1
+
+        # —— 第一关：认证 ——
+        # 未认证的连接只允许两件事：补交令牌（hello）、探活（ping）。
+        # 这不是「礼貌性」的限制：设备影子包含「家里有没有人」「门锁着没有」，
+        # 让任何人连上就能读到，本身就是信息泄漏。
+        if not client.authed and not self.allow_anonymous:
+            if msg_type == "hello":
+                self._on_client_hello(client, msg, msg_id)
+                return
+            if msg_type == "ping":
+                self._send(client, envelope("pong", {"echo": msg.get("payload")}, id=msg_id))
+                return
+            self._send_error(
+                client, ERROR_CODES.UNAUTHORIZED,
+                "连接尚未认证。请在子协议头、查询串或首帧 hello 中提供令牌", msg_id)
+            self._close_later(client, 4401, "unauthorized")
+            return
+
+        # —— 第二关：协议版本 ——
+        # 主版本不一致时直接拒绝。放行会让新旧客户端各读一半字段，
+        # 表现为「界面上某些值永远不动」，比直接报错难查得多。
+        version = msg.get("v")
+        if isinstance(version, str) and version:
+            if version.split(".")[0] != PROTOCOL_VERSION.split(".")[0]:
+                self._send_error(
+                    client, ERROR_CODES.PROTOCOL_MISMATCH,
+                    f"协议主版本不匹配：服务端 {PROTOCOL_VERSION}，客户端 {version}。"
+                    f"请更新客户端或改用匹配版本", msg_id)
+                self._close_later(client, 4426, "protocol mismatch")
+                return
 
         if msg_type == "command":
             self._on_command(client, msg, msg_id)
@@ -483,142 +820,510 @@ class Gateway:
             self._on_scene(client, msg, msg_id)
         elif msg_type == "ping":
             self._send(client, envelope("pong", {"echo": msg.get("payload")}, id=msg_id))
+        elif msg_type == "pong":
+            # 客户端回应了心跳 —— 这是判断对端还活着的主要依据。
+            # 超时判定只看 last_pong 距今多久（见 _heartbeat_loop），无需计数器。
+            client.last_pong = time.monotonic()
         elif msg_type == "snapshot":
             self.push_snapshot(client)
+        elif msg_type == "resync":
+            self._on_resync(client, msg, msg_id)
+        elif msg_type == "ota":
+            await self._on_ota(client, msg, msg_id)
         elif msg_type == "setup":
             await self._on_setup(client, msg, msg_id)
         elif msg_type == "setupAuth":
             self._on_setup_auth(client, msg, msg_id)
         else:
-            self._send(client, envelope("error", {
-                "code": "UNKNOWN_TYPE",
-                "message": f"未识别的消息类型：{msg_type}",
-            }, id=msg_id))
+            self._send_error(client, ERROR_CODES.UNKNOWN_TYPE,
+                             f"未识别的消息类型：{msg_type}", msg_id)
+
+    # ---------------- 认证辅助 ----------------
+
+    def check_access_token(self, token: str) -> bool:
+        """供 main.py 在握手阶段调用（从子协议头 / 查询串提取到的令牌）。"""
+        if self.allow_anonymous:
+            return True
+        return security.equals(token, self.token)
+
+    def _on_client_hello(self, client: Client, msg: dict, msg_id: str) -> None:
+        """首帧认证：连接建立时没带令牌的客户端，可以用 hello 补交。"""
+        payload = msg.get("payload") or {}
+        token = str(payload.get("token") or "")
+        if not self.check_access_token(token):
+            self._send_error(client, ERROR_CODES.UNAUTHORIZED, "令牌无效", msg_id)
+            self._close_later(client, 4401, "unauthorized")
+            return
+        client.authed = True
+        self._send(client, envelope("ack", {"ok": True, "authed": True}, id=msg_id))
+        self._push_authed_greeting(client)
+
+    def _close_later(self, client: Client, code: int, reason: str) -> None:
+        """
+        稍后关闭连接。
+
+        为什么不直接 close：那样客户端只会看到「连接断了」，
+        完全不知道是鉴权失败还是网络抖动。先把错误报文发出去、稍等一瞬
+        再关，客户端才有机会把原因显示给用户。
+        """
+        async def closer() -> None:
+            await asyncio.sleep(0.05)
+            try:
+                await client.ws.close(code=code, reason=reason)
+            except Exception:
+                pass
+        asyncio.create_task(closer())
+
+    def _on_resync(self, client: Client, msg: dict, msg_id: str) -> None:
+        """
+        序号对齐请求。
+
+        客户端发现出站 seq 跳号（说明中间有报文被丢弃）后发这个请求，
+        服务端直接回一份全量快照 —— 与真实 IoT 平台的做法一致：
+        增量丢了就用全量对齐，不做无限历史重放（那需要服务端保存全部历史，
+        而历史越长、重放越慢，反而不如一次全量来得干脆）。
+        """
+        payload = msg.get("payload") or {}
+        client.resync_needed = False
+        self._send(client, envelope("ack", {
+            "ok": True, "resync": True,
+            "since": payload.get("since"),
+            "currentSeq": client.out_seq,
+        }, id=msg_id))
+        self.push_snapshot(client)
+
+    def _send_error(self, client: Client, code: str, message: str,
+                    msg_id: str | None = None,
+                    details: list[dict[str, str]] | None = None) -> None:
+        self._send(client, envelope(
+            "error", validate.error_payload(code, message, details), id=msg_id))
+
+    async def _on_ota(self, client: Client, msg: dict, msg_id: str) -> None:
+        """
+        固件升级（OTA）。
+
+        真实设备的升级不是一个请求就完事的，而是一条状态机：
+        下载 → 校验 → 安装 → 重启 → 生效，每一步都可能失败、都可能超时。
+        这里实现同样的状态机（教学场景下进度是模拟的，不做真实下载）。
+
+        为什么值得做：没有 OTA 能力的设备，出厂后就没法修 bug ——
+        这在真实产品里是硬需求，也是判断「是不是真设备」的一条标准。
+        """
+        payload = msg.get("payload") or {}
+        target = str(payload.get("target") or "")
+        version = str(payload.get("version") or "").strip()
+
+        device = self.devices.get(target)
+        if device is None:
+            self._send_ack(client, msg_id, msg.get("id"), {
+                "ok": False,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.DEVICE_NOT_FOUND, f"设备不存在：{target}"),
+            })
+            return
+        if not version:
+            self._send_ack(client, msg_id, msg.get("id"), {
+                "ok": False,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.INVALID_PARAM, "缺少目标固件版本号 version"),
+            })
+            return
+        if not device.online:
+            self._send_ack(client, msg_id, msg.get("id"), {
+                "ok": False,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.DEVICE_OFFLINE, f"{device.name} 当前离线，无法升级"),
+            })
+            return
+
+        self._send_ack(client, msg_id, msg.get("id"), {
+            "ok": True, "status": "ACCEPTED",
+            "deviceId": target, "version": version,
+            "firmware": device.firmware,
+        })
+
+        async def runner() -> None:
+            stages = (
+                ("downloading", 0.15), ("downloading", 0.55),
+                ("verifying", 0.75), ("applying", 0.9),
+                ("rebooting", 0.95), ("success", 1.0),
+            )
+            for state_name, progress in stages:
+                await asyncio.sleep(0.8)
+                self.broadcast(envelope("ota", {
+                    "deviceId": target,
+                    "version": version,
+                    "state": state_name,
+                    "progress": progress,
+                }))
+            device.firmware = version
+            device.updated_at = now_ms()
+            self._broadcast_state(device, STATE_KIND.FULL)
+            self.broadcast_event({
+                "level": "ok", "source": target,
+                "message": f"{device.name} 固件已升级到 {version}",
+            })
+
+        asyncio.create_task(runner())
+
+    # ---------------- 命令 ----------------
 
     def _on_command(self, client: Client, msg: dict, msg_id: str) -> None:
         payload = msg.get("payload") or {}
         device_id = payload.get("deviceId")
         action = payload.get("action")
         params = payload.get("params") or {}
-        device = self.devices.get(device_id)
-        if device is None:
-            self._send(client, envelope("ack", {
-                "ok": False, "deviceId": device_id, "action": action, "error": "设备不存在",
-            }, id=msg_id, ref=msg.get("id")))
+        command_id = msg.get("id")
+
+        # 限流。真实网关一定会限制单连接的命令速率 ——
+        # 否则一个写错的 for 循环就能把设备刷到不停开关。
+        if not client.take_token(self.command_rate_limit):
+            self._rate_limited += 1
+            self._send_ack(client, msg_id, command_id, {
+                "ok": False, "deviceId": device_id, "action": action,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.RATE_LIMITED,
+                    f"命令过于频繁（上限 {self.command_rate_limit:g} 条/秒），请稍后重试"),
+            })
             return
 
-        result = self._execute(device, action, params)
-        if result["ok"]:
-            self._sync_stream(device)
-        stream = self.hub.info(device.channel) if device.channel else None
-        self._send(client, envelope("ack", {
-            "ok": result["ok"],
+        device = self.devices.get(device_id)
+        if device is None:
+            self._send_ack(client, msg_id, command_id, {
+                "ok": False, "deviceId": device_id, "action": action,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.DEVICE_NOT_FOUND, f"设备不存在：{device_id}"),
+            })
+            return
+
+        self._commands_total += 1
+
+        # 离线设备不假装成功。真实网关会告知上层「设备不可达」，
+        # 而不是回一个 ok 让调用方以为灯已经开了。
+        if not device.online:
+            self._send_ack(client, msg_id, command_id, {
+                "ok": False, "deviceId": device_id, "action": action,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.DEVICE_OFFLINE,
+                    f"{device.name} 当前离线，命令未下发"),
+                "desired": dict(device.desired),
+            })
+            return
+
+        result = self._resolve_action(device, action, params)
+        if not result["ok"]:
+            self._send_ack(client, msg_id, command_id, {
+                "ok": False, "deviceId": device_id, "action": action,
+                "errorInfo": result["error"],
+            })
+            return
+
+        # 立即动作：人脸登记询问面板的两个按钮。
+        # 它们不是设备状态变更，而是网关自身的一次性交互，不参与执行延迟。
+        if result.get("immediate"):
+            outcome = result["run"]()
+            self._send_ack(client, msg_id, command_id, {
+                "ok": bool(outcome.get("ok")),
+                "deviceId": device_id, "action": action,
+                "errorInfo": (None if outcome.get("ok") else validate.error_payload(
+                    ERROR_CODES.INVALID_PARAM, str(outcome.get("error") or "操作失败"))),
+                "state": dict(device.reported),
+            })
+            return
+
+        patch = result["patch"]
+        # 写入期望态。注意这里**还没有**改 reported ——
+        # 「命令已接受」与「设备已执行」是两件事，混为一谈就无法表达
+        # 命令在路上、设备没响应、执行失败这些真实存在的中间态。
+        device.desired.update(patch)
+        delta = device.delta()
+
+        self._send_ack(client, msg_id, command_id, {
+            "ok": True,
+            "status": "ACCEPTED",
             "deviceId": device_id,
             "action": action,
-            "error": result.get("error"),
-            "state": device.state,
-            "stream": stream,
-        }, id=msg_id, ref=msg.get("id")))
+            "desired": dict(device.desired),
+            "delta": delta,
+            "stream": self.hub.info(device.channel) if device.channel else None,
+        })
+        self._schedule_execution(device, command_id, result.get("event"))
 
-        if result["ok"]:
+    def _send_ack(self, client: Client, msg_id: str, ref: str | None, body: dict[str, Any]) -> None:
+        """
+        构造并下发 ack。
+
+        兼容处理：errorInfo 是结构化对象（新客户端按 code 分支），
+        error 是同一内容的纯字符串（老客户端直接显示）。
+        两者并存到下一个主版本；届时移除 error。
+        """
+        info = body.get("errorInfo")
+        if info:
+            body["error"] = info.get("message") or ""
+        self._send(client, envelope("ack", body, id=msg_id, ref=ref))
+
+    def _schedule_execution(self, device: Device, command_id: str | None,
+                            event: dict[str, Any] | None = None) -> None:
+        """
+        调度「设备执行」：延迟若干毫秒后把 desired 合并进 reported。
+
+        两个延迟来源取较大者：
+          · execLatencyMs —— 模拟器件动作耗时（继电器吸合、锁舌弹出、压缩机启动）
+          · coalesce_window_ms —— 抖动合并窗口
+
+        抖动合并的意义：连续拖动亮度滑块会产生几十条命令，
+        真实设备只会执行最终值。这里取消上一次未执行的定时器、重新计时，
+        效果就是「只有最后一次生效」，而不是把 30 个中间值全打一遍。
+        """
+        previous = self._coalesce_pending.get(device.id)
+        if previous and previous.get("handle"):
+            previous["handle"].cancel()
+
+        latency = float(device.behavior()["execLatencyMs"]) / 1000.0
+        window = self.coalesce_window_ms / 1000.0
+        delay = max(latency, window)
+
+        async def run() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # 被更新的命令取代：这是合并的正常路径，不是错误
+                return
+            self._coalesce_pending.pop(device.id, None)
+            if not device.online:
+                return
+            self._commit_desired(device, command_id, event)
+
+        handle = asyncio.create_task(run())
+        self._coalesce_pending[device.id] = {"handle": handle}
+        device.pending = [t for t in device.pending if not t.done()]
+        device.pending.append(handle)
+
+    def _commit_desired(self, device: Device, command_id: str | None,
+                        event: dict[str, Any] | None = None) -> None:
+        """把期望态落到上报态，并按「变化了哪些字段」广播。"""
+        pending = device.delta()
+        if not pending:
+            # 期望值与当前值相同：不产生任何报文。
+            # 旧版会照发一条 state，让客户端以为状态变了。
+            return
+
+        # 云台角度不是瞬间跳变的。真实云台转动时，位置传感器会报出
+        # 若干中间角度；直接写终值会让人误以为它是「瞬移」的。
+        if device.type == "camera" and "pan" in pending:
+            target = float(pending.pop("pan"))
+            self._start_pan_move(device, target, command_id)
+            if not pending:
+                return
+
+        for key, value in pending.items():
+            device.reported[key] = value
+        device.updated_at = now_ms()
+        # 已落地的字段从期望态里移除；未落地的（如云台角度）保留
+        device.desired = {k: v for k, v in device.desired.items() if k not in pending}
+
+        extra = self._normalize(device)
+        changed = {**pending, **extra}
+        self._sync_stream(device)
+        self._broadcast_state(device, STATE_KIND.CONFIRMED, fields=changed, ref=command_id)
+        # 有语义事件就用语义事件（「大门人脸锁 已开锁」），没有才退回通用描述 ——
+        # 「客厅主灯 已执行（2 个字段生效）」这种话对使用者没有任何信息量。
+        self.broadcast_event(event or {
+            "level": "info", "source": device.id,
+            "message": f"{device.name} 已执行（{len(changed)} 个字段生效）",
+        })
+
+    def _normalize(self, device: Device) -> dict[str, Any]:
+        """
+        设备内部的物理约束。
+
+        这些不是「业务规则」而是物理事实：灯关着的时候亮度必然是 0，
+        摄像头关机的时候不可能还在出画面。放在这里统一处理，
+        比散落在每个动作分支里可靠。
+        """
+        s = device.reported
+        extra: dict[str, Any] = {}
+        if device.type == "light":
+            if not s.get("power") and s.get("brightness"):
+                s["brightness"] = 0
+                extra["brightness"] = 0
+            elif s.get("power") and not s.get("brightness"):
+                s["brightness"] = 70
+                extra["brightness"] = 70
+        elif device.type == "camera":
+            if not s.get("power") and s.get("streaming"):
+                s["streaming"] = False
+                extra["streaming"] = False
+        return extra
+
+    def _start_pan_move(self, device: Device, target: float, command_id: str | None) -> None:
+        """
+        云台渐进转动。
+
+        按 PAN["speed"] 度/秒推进，取 4 个中间位置上报 ——
+        既能看出「它是在转的」，又不会因为每度一条报文把链路刷爆。
+        """
+        start = float(device.reported.get("pan") or 0.0)
+        step = float(PAN["step"])
+        # 走最短弧（顺时针 / 逆时针取近的那边）
+        diff = (target - start + 180.0) % 360.0 - 180.0
+        if abs(diff) < step:
+            device.reported["pan"] = target % 360.0
+            device.desired.pop("pan", None)
             device.updated_at = now_ms()
-            self.broadcast(envelope("state", {
-                "deviceId": device_id,
-                "type": device.type,
-                "room": device.room,
-                "state": device.state,
-                "online": device.online,
-            }))
-            if result.get("event"):
-                self.broadcast_event(result["event"])
+            self._broadcast_state(device, STATE_KIND.CONFIRMED,
+                                  fields={"pan": device.reported["pan"]}, ref=command_id)
+            return
 
-    def _execute(self, device: Device, action: str, params: dict) -> dict[str, Any]:
-        s = device.state
-        if action == "set" and isinstance(params, dict):
-            return self._apply_patch(device, params)
+        waypoints = 4
+        points = [start + diff * (i + 1) / waypoints for i in range(waypoints)]
+        duration = abs(diff) / max(float(PAN["speed"]), 1.0)
+        gap = max(duration / waypoints, 0.05)
+
+        async def mover() -> None:
+            for index, angle in enumerate(points):
+                await asyncio.sleep(gap)
+                value = round((angle % 360.0) / step) * step % 360.0
+                device.reported["pan"] = value
+                device.updated_at = now_ms()
+                kind = STATE_KIND.CONFIRMED if index == len(points) - 1 else STATE_KIND.DELTA
+                self._broadcast_state(device, kind, fields={"pan": value},
+                                      ref=command_id if index == len(points) - 1 else None)
+            device.desired.pop("pan", None)
+            self._sync_stream(device)
+
+        task = asyncio.create_task(mover())
+        device.pending.append(task)
+
+    # ---------------- 动作解析（不执行，只定稿要写什么） ----------------
+
+    def _err(self, code: str, message: str,
+             details: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        return {"ok": False, "error": validate.error_payload(code, message, details)}
+
+    def _resolve_action(self, device: Device, action: str, params: dict) -> dict[str, Any]:
+        """
+        把动作解析成一份写指令。
+
+        为什么不直接执行：两阶段提交要求「先校验、后执行」。
+        这样非法参数在写入期望态之前就被拦下，设备不会停在
+        用户没预期过的中间状态上。
+        """
+        spec = device_by_id(device.id)
+        if spec is None:
+            return self._err(ERROR_CODES.DEVICE_NOT_FOUND, f"设备不存在：{device.id}")
+
+        s = device.reported
+
+        if action == "set":
+            if device.type == "sensor":
+                return self._err(ERROR_CODES.READ_ONLY_DEVICE,
+                                 f"{device.name} 是只读遥测设备，不接受写操作")
+            cleaned, errors = validate.validate_patch(spec, params)
+            if errors:
+                return self._err(validate.error_code_for(errors),
+                                 f"{device.name} 拒绝了 {len(errors)} 个字段", errors)
+            if not cleaned:
+                return self._err(ERROR_CODES.INVALID_PARAM, "没有需要写入的字段")
+            return {"ok": True, "patch": cleaned}
 
         if device.type == "light":
+            if "switch" not in spec.capabilities:
+                return self._err(ERROR_CODES.UNSUPPORTED_CAPABILITY, "该灯具不支持开关")
             if action == "toggle":
-                return self._apply_patch(device, {"power": not s["power"], "brightness": 0 if s["power"] else (s["brightness"] or 80)})
+                return {"ok": True, "patch": {
+                    "power": not s.get("power"),
+                    "brightness": 0 if s.get("power") else (s.get("brightness") or 80),
+                }}
             if action == "on":
-                return self._apply_patch(device, {"power": True, "brightness": params.get("brightness") or (s["brightness"] or 80)})
+                level = params.get("brightness") or (s.get("brightness") or 80)
+                cleaned, errors = validate.validate_patch(spec, {"brightness": level})
+                if errors:
+                    return self._err(ERROR_CODES.INVALID_PARAM, "亮度不合法", errors)
+                return {"ok": True, "patch": {"power": True, "brightness": cleaned["brightness"]}}
             if action == "off":
-                return self._apply_patch(device, {"power": False, "brightness": 0})
+                return {"ok": True, "patch": {"power": False}}
+
         elif device.type == "ac":
             if action == "toggle":
-                return self._apply_patch(device, {"power": not s["power"]})
+                return {"ok": True, "patch": {"power": not s.get("power")}}
             if action == "on":
-                return self._apply_patch(device, {"power": True})
+                return {"ok": True, "patch": {"power": True}}
             if action == "off":
-                return self._apply_patch(device, {"power": False})
+                return {"ok": True, "patch": {"power": False}}
+
         elif device.type == "camera":
             if action == "pan":
-                return self._apply_patch(device, {"pan": params.get("pan")})
+                cleaned, errors = validate.validate_patch(spec, {"pan": params.get("pan")})
+                if errors:
+                    return self._err(ERROR_CODES.INVALID_PARAM, "云台角度不合法", errors)
+                return {"ok": True, "patch": {"pan": cleaned["pan"]}}
             if action == "nudge":
-                return self._apply_patch(device, {"pan": s["pan"] + (params.get("delta") or 15)})
+                cleaned, errors = validate.validate_patch(spec, {"delta": params.get("delta", 15)})
+                if errors:
+                    return self._err(ERROR_CODES.INVALID_PARAM, "云台步进量不合法", errors)
+                target = (float(s.get("pan") or 0.0) + cleaned["delta"]) % 360.0
+                return {"ok": True, "patch": {"pan": round(target, 1)}}
             if action == "toggle":
-                return self._apply_patch(device, {"power": not s["power"]})
+                return {"ok": True, "patch": {"power": not s.get("power")}}
             if action == "arm":
-                return self._apply_patch(device, {"armed": params.get("armed") is not False})
-            # 推送 / 停止画面：只切通道的实景与待机，不改设备开关
+                if "switch" not in spec.capabilities:
+                    return self._err(ERROR_CODES.UNSUPPORTED_CAPABILITY, "该摄像头不支持布防")
+                return {"ok": True, "patch": {"armed": params.get("armed") is not False}}
             if action == "stream":
-                return self._apply_patch(device, {"streaming": params.get("on") is not False})
+                return {"ok": True, "patch": {"streaming": params.get("on") is not False}}
+
         elif device.type == "lock":
             if action == "lock":
                 return self._lock(device, True, params)
             if action == "unlock":
                 return self._lock(device, False, params)
             if action == "stream":
-                return self._apply_patch(device, {"streaming": params.get("on") is not False})
-            # 陌生人脸登记询问面板的两个动作（事件 / 询问广播已在方法内完成）
+                return {"ok": True, "patch": {"streaming": params.get("on") is not False}}
+            # 陌生人脸登记询问面板的两个动作：网关自身的交互，不经过设备延迟
             if action == "enrollFace":
-                return self._enroll_lock_user(str(params.get("token") or ""),
-                                              str(params.get("name") or ""))
+                token = str(params.get("token") or "")
+                name = str(params.get("name") or "")
+                return {"ok": True, "immediate": True,
+                        "run": lambda: self._enroll_lock_user(token, name)}
             if action == "dismissEnroll":
-                return self._dismiss_enroll_prompt(str(params.get("token") or ""))
+                token = str(params.get("token") or "")
+                return {"ok": True, "immediate": True,
+                        "run": lambda: self._dismiss_enroll_prompt(token)}
 
-        return {"ok": False, "error": f"动作 {action} 不适用于 {device.type}"}
+        return self._err(ERROR_CODES.ACTION_NOT_SUPPORTED,
+                         f"动作 {action} 不适用于 {device.type}")
 
     def _apply_patch(self, device: Device, patch: dict) -> dict[str, Any]:
-        s = device.state
-        if device.type == "light":
-            if "power" in patch:
-                s["power"] = bool(patch["power"])
-            if "brightness" in patch:
-                s["brightness"] = int(clamp(float(patch["brightness"] or 0), 0, 100))
-            if "colorTemp" in patch:
-                s["colorTemp"] = int(clamp(float(patch["colorTemp"] or 4000), 2700, 6500))
-            if not s["power"]:
-                s["brightness"] = 0
-            if s["power"] and s["brightness"] == 0:
-                s["brightness"] = 70
-        elif device.type == "ac":
-            if "power" in patch:
-                s["power"] = bool(patch["power"])
-            if "mode" in patch and patch["mode"] in ("cool", "heat", "fan", "dry", "auto"):
-                s["mode"] = patch["mode"]
-            if "targetTemp" in patch:
-                s["targetTemp"] = int(clamp(float(patch["targetTemp"] or 26), 16, 30))
-            if "fan" in patch and patch["fan"] in ("low", "mid", "high", "auto"):
-                s["fan"] = patch["fan"]
-        elif device.type == "camera":
-            if "power" in patch:
-                s["power"] = bool(patch["power"])
-            if "streaming" in patch:
-                s["streaming"] = bool(patch["streaming"]) and s["power"]
-            if "pan" in patch:
-                s["pan"] = (float(patch["pan"]) % 360 + 360) % 360
-            if "armed" in patch:
-                s["armed"] = bool(patch["armed"])
-        elif device.type == "sensor":
-            return {"ok": False, "error": "传感器为只读遥测设备"}
-        elif device.type == "lock":
-            if "locked" in patch:
-                return self._lock(device, bool(patch["locked"]), patch)
-            if "streaming" in patch:
-                s["streaming"] = bool(patch["streaming"])
+        """
+        内部写路径（场景联动使用）。
 
-        return {"ok": True, "event": {
+        与用户命令的区别：场景是网关自己发起的一批变更，
+        不需要走「期望态 → 延迟 → 确认」，直接改上报态即可。
+        但仍要经过 _normalize 处理物理约束，并返回本次真正变化的字段。
+        """
+        if device.type == "sensor":
+            return {"ok": False, "error": validate.error_payload(
+                ERROR_CODES.READ_ONLY_DEVICE, "传感器为只读遥测设备")}
+
+        changed: dict[str, Any] = {}
+        for key, value in patch.items():
+            if key == "locked":
+                device.reported["locked"] = bool(value)
+                device.reported["lastResult"] = "locked" if value else "unlocked"
+                changed["locked"] = device.reported["locked"]
+                continue
+            if key not in device.reported:
+                # 未声明字段：内部调用也应立即暴露问题，而不是悄悄写进去
+                print(f"[gateway] 警告：场景写入 {device.id} 的未知字段 {key}")
+                continue
+            device.reported[key] = value
+            changed[key] = value
+
+        extra = self._normalize(device)
+        changed.update(extra)
+        device.updated_at = now_ms()
+        return {"ok": True, "changed": changed, "event": {
             "level": "info", "source": device.id, "message": f"{device.name} 状态已更新",
         }}
 
@@ -638,16 +1343,31 @@ class Gateway:
                 self.video_source.close(timeout=0.0)
 
     def _lock(self, device: Device, locked: bool, params: dict) -> dict[str, Any]:
-        device.state["locked"] = locked
-        device.state["lastResult"] = "locked" if locked else "unlocked"
-        if params.get("person"):
-            device.state["lastPerson"] = params["person"]
+        """
+        门锁开关。
+
+        返回 patch 而不是直接改状态 —— 锁是有物理动作时间的器件（锁舌要动），
+        所以它和其它设备一样走「接受 → 执行 → 确认」的两阶段流程。
+        事件也一并带出来，由提交阶段广播：这样事件描述的是「门真的锁上了」，
+        而不是「网关收到了锁门请求」。
+        """
+        patch: dict[str, Any] = {
+            "locked": locked,
+            "lastResult": "locked" if locked else "unlocked",
+        }
         person = params.get("person")
-        return {"ok": True, "event": {
-            "level": "warn" if locked else "ok",
-            "source": device.id,
-            "message": f"{device.name} 已上锁" if locked else f"{device.name} 已开锁" + (f" · {person}" if person else ""),
-        }}
+        if person:
+            patch["lastPerson"] = str(person)
+        return {
+            "ok": True,
+            "patch": patch,
+            "event": {
+                "level": "warn" if locked else "ok",
+                "source": device.id,
+                "message": (f"{device.name} 已上锁" if locked else f"{device.name} 已开锁")
+                           + (f" · {person}" if person else ""),
+            },
+        }
 
     # ---------------- 人脸画面上传 ----------------
 
@@ -975,31 +1695,78 @@ class Gateway:
             print(f"[lock] 画面来源持久化失败：{err!r}")
             return False
 
-    def _broadcast_device_state(self, device: Device) -> None:
-        self.broadcast(envelope("state", {
+    def _broadcast_state(self, device: Device, kind: str,
+                         fields: dict[str, Any] | None = None,
+                         ref: str | None = None) -> None:
+        """
+        广播一条 state 报文。
+
+        fields 为 None 时发全量 reported，否则只发指定字段（增量语义）。
+        每个客户端有独立的出站序号 seq —— 客户端据此发现自己漏收了报文，
+        进而发起 resync，而不是默默显示一个过期的值。
+        """
+        body: dict[str, Any] = {
             "deviceId": device.id,
             "type": device.type,
             "room": device.room,
-            "state": device.state,
+            "state": dict(device.reported) if fields is None else dict(fields),
+            "stateKind": kind,
             "online": device.online,
-        }))
+            "updatedAt": device.updated_at,
+        }
+        if ref:
+            body["ref"] = ref
+        # 传感器的派生量只在温湿度**确实上报了**的时候附带。
+        # 若这次只是电量变化，再带一份 THI 就是冗余 ——
+        # 真实设备也不会因为电量变了就重算一遍环境舒适度。
+        if device.type == "sensor":
+            touched = fields is None or any(
+                key in fields for key in ("temperature", "humidity"))
+            if touched:
+                body["derived"] = derived.sensor_derived(
+                    float(device.reported.get("temperature") or 0.0),
+                    float(device.reported.get("humidity") or 0.0),
+                    at=device.updated_at,
+                )
+        for client in list(self.clients):
+            if not client.authed:
+                continue
+            payload = dict(body)
+            payload["seq"] = client.next_seq()
+            client.push(json_dumps(envelope("state", payload)),
+                        coalesce_key=f"state:{device.id}")
+
+    def _broadcast_device_state(self, device: Device) -> None:
+        """全量广播某设备状态（供既有的非命令路径调用）。"""
+        self._broadcast_state(device, STATE_KIND.FULL)
 
     def _setup_denied(self, client: Client, msg: dict, msg_id: str, error: str) -> None:
-        self._send(client, envelope("ack", {"ok": False, "error": error},
-                                    id=msg_id, ref=msg.get("id")))
+        self._send_ack(client, msg_id, msg.get("id"), {
+            "ok": False,
+            "errorInfo": validate.error_payload(ERROR_CODES.SETUP_DENIED, error),
+        })
         self.broadcast_event({"level": "warn", "source": "setup", "message": f"镜像设置被拒绝：{error}"})
+
+    def _check_setup_password(self, value: Any) -> bool:
+        """
+        校验初始化口令。
+
+        只比对哈希，且用常数时间比较。口令明文不落任何文件、
+        也不进前端资源 —— 这是 v2.0 相对 1.0 最要紧的一处修正。
+        """
+        return security.verify_password(str(value or ""), self.setup_password_hash)
 
     def _on_setup_auth(self, client: Client, msg: dict, msg_id: str) -> None:
         """镜像设置第一步：只校验口令，通过后前端才展开设置卡片。"""
         payload = msg.get("payload") or {}
-        if str(payload.get("password") or "") != SETUP_PASSWORD:
+        if not self._check_setup_password(payload.get("password")):
             self._setup_denied(client, msg, msg_id, "初始化口令不正确")
             return
         self._send(client, envelope("ack", {"ok": True}, id=msg_id, ref=msg.get("id")))
 
     async def _on_setup(self, client: Client, msg: dict, msg_id: str) -> None:
         payload = msg.get("payload") or {}
-        if str(payload.get("password") or "") != SETUP_PASSWORD:
+        if not self._check_setup_password(payload.get("password")):
             self._setup_denied(client, msg, msg_id, "初始化口令不正确")
             return
 
@@ -1007,19 +1774,15 @@ class Gateway:
         raw_lat, raw_lon = payload.get("lat"), payload.get("lon")
         lat_blank = raw_lat in (None, "")
         lon_blank = raw_lon in (None, "")
-        latitude = longitude = None
         if lat_blank != lon_blank:
             self._setup_denied(client, msg, msg_id, "经纬度需同时填写，或同时留空")
             return
-        if not lat_blank:
-            try:
-                latitude, longitude = float(raw_lat), float(raw_lon)
-            except (TypeError, ValueError):
-                self._setup_denied(client, msg, msg_id, "经纬度超出合法范围")
-                return
-            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-                self._setup_denied(client, msg, msg_id, "经纬度超出合法范围")
-                return
+        latitude, longitude, errors = validate.validate_coordinates(raw_lat, raw_lon)
+        if errors:
+            self._setup_denied(client, msg, msg_id, errors[0]["reason"])
+            return
+        if lat_blank:
+            latitude = longitude = None
 
         # 大门锁画面来源（image / camera / stream）：与定位相互独立，先切来源
         source_patch = payload.get("lockSource")
@@ -1096,37 +1859,69 @@ class Gateway:
             })
 
     def _seed_indoor_from_outdoor(self) -> None:
-        """用室外预报给室内传感器和空调回风一个合理起点，避免定位后室内还停在默认值。"""
+        """
+        用室外预报给室内传感器和空调回风一个合理起点，
+        避免定位完成后室内还停在默认值上。
+
+        注意这里不再计算 comfort：派生量由 _broadcast_state 在发包时统一算，
+        存进设备状态会导致「同一个值在多处维护」，早晚不一致。
+        """
         base = self.outdoor["temp"]
         for device in self.devices.values():
             if device.type == "ac":
-                device.state["indoorTemp"] = round1(base - (1.1 if device.floor == 2 else 0.4))
+                device.reported["indoorTemp"] = round1(base - (1.1 if device.floor == 2 else 0.4))
             if device.type == "sensor":
                 cook = 1.4 if device.room == "kitchen" else 0
                 floor_drop = 1.0 if device.floor == 2 else 0.3
-                device.state["temperature"] = round1(base - floor_drop + cook)
-                device.state["humidity"] = round1(clamp(
-                    self.outdoor["humidity"] - (4 if device.room == "bath" else 12), 30, 90))
-                device.state["comfort"] = _comfort(device.state["temperature"], device.state["humidity"])
+                device.reported["temperature"] = quantize(
+                    "sensor", "temperature", round1(base - floor_drop + cook))
+                device.reported["humidity"] = quantize(
+                    "sensor", "humidity",
+                    round1(clamp(self.outdoor["humidity"] - (4 if device.room == "bath" else 12), 30, 90)))
             device.updated_at = now_ms()
+        # 定位变更相当于设备「重新测量了一次」：把当前值记为已上报，
+        # 让接下来的变化上报从新基线开始算，而不是把整批变化量一次性推出去。
+        for device in self.devices.values():
+            device.seed_reported()
 
     def _on_scene(self, client: Client, msg: dict, msg_id: str) -> None:
         scene_id = (msg.get("payload") or {}).get("sceneId")
         if scene_id not in SCENES:
-            self._send(client, envelope("ack", {"ok": False, "error": "未知场景"}, id=msg_id))
+            self._send_ack(client, msg_id, msg.get("id"), {
+                "ok": False,
+                "errorInfo": validate.error_payload(
+                    ERROR_CODES.INVALID_PARAM,
+                    f"未知场景：{scene_id}（可用：{'/'.join(SCENES)}）"),
+            })
             return
         self._apply_scene(scene_id, source="user")
         self._send(client, envelope("ack", {"ok": True, "sceneId": scene_id}, id=msg_id))
 
     def _apply_scene(self, scene_id: str, *, silent: bool = False, source: str = "scene") -> None:
+        """
+        应用场景。
+
+        与旧版的关键区别：不再在末尾无脑 broadcast_snapshot()。
+        全量快照会把十几台设备的状态一次性推给所有客户端，而场景往往
+        只改了其中几台 —— 这是典型的「广播放大」。现在只对真正变化的设备
+        发增量报文，没变化的设备一条都不发。
+
+        另外，场景里的云台角度按「预置位」处理：直接定位，不走渐进转动
+        （真实云台切换预置位也是快速定位，而不是慢慢转过去）。
+        """
         self.scene = scene_id
+        changed: dict[str, dict[str, Any]] = {}
 
         def set_state(device_id: str, patch: dict) -> None:
             d = self.devices.get(device_id)
             if d is None:
                 return
-            self._apply_patch(d, patch)
-            d.updated_at = now_ms()
+            result = self._apply_patch(d, patch)
+            if not result.get("ok"):
+                return
+            fields = result.get("changed") or {}
+            if fields:
+                changed[device_id] = {**changed.get(device_id, {}), **fields}
 
         if scene_id == "home":
             self.occupancy = "home"
@@ -1169,25 +1964,40 @@ class Gateway:
         for d in self.devices.values():
             self._sync_stream(d)
 
-        if not silent:
-            self.broadcast(envelope("scene", {
-                "sceneId": scene_id,
-                "name": SCENES[scene_id]["name"],
-                "occupancy": self.occupancy,
-                "source": source,
-            }))
-            self.broadcast_snapshot()
-            self.broadcast_event({
-                "level": "ok", "source": "scene",
-                "message": f"已切换到{SCENES[scene_id]['name']}",
-            })
+        if silent:
+            return
+
+        for device_id, fields in changed.items():
+            device = self.devices.get(device_id)
+            if device is not None:
+                self._broadcast_state(device, STATE_KIND.CONFIRMED, fields=fields)
+
+        self.broadcast(envelope("scene", {
+            "sceneId": scene_id,
+            "name": SCENES[scene_id]["name"],
+            "occupancy": self.occupancy,
+            "source": source,
+            "changed": {k: list(v.keys()) for k, v in changed.items()},
+        }))
+        self.broadcast_event({
+            "level": "ok", "source": "scene",
+            "message": f"已切换到{SCENES[scene_id]['name']}（{len(changed)} 台设备状态更新）",
+        })
 
     # ---------------- 周期任务 ----------------
 
     async def _loop_telemetry(self) -> None:
+        """
+        遥测采样循环。
+
+        周期是**采样**周期，不是上报周期 —— 这两件事在真实设备里是分开的：
+        传感器内部可能每秒量一次，但只在变化超过阈值时才发报文。
+        旧版把两者混为一谈（每 2 秒采样并**无条件**广播），
+        结果是稳态下恒定 2 条/秒的无效流量、约 28% 的内容是重复值。
+        """
         while True:
             try:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(TELEMETRY_SAMPLE_INTERVAL)
                 self._tick_telemetry()
             except asyncio.CancelledError:
                 raise
@@ -1204,62 +2014,216 @@ class Gateway:
             except Exception as err:
                 print(f"[gateway] 流信令任务异常：{err!r}")
 
+    async def _loop_heartbeat(self) -> None:
+        """服务端心跳：定期 ping，连续多次没回 pong 就断开该客户端。"""
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                self._tick_heartbeat()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                print(f"[gateway] 心跳任务异常：{err!r}")
+
+    def _tick_heartbeat(self) -> None:
+        """
+        心跳与失联清理。
+
+        旧版只有客户端主动 ping、服务端从不主动发，于是「对端还活着吗」
+        这个问题永远得不到答案：断网的客户端会一直占着流通道，
+        直到 TCP 超时（可能十几分钟）。
+        """
+        now = time.monotonic()
+        for client in list(self.clients):
+            if not client.authed:
+                # 未认证连接的宽限期由 main.py 的收包超时负责
+                continue
+            idle = now - client.last_pong
+            if idle > HEARTBEAT_INTERVAL * HEARTBEAT_MAX_MISSES:
+                print(f"[gateway] 客户端心跳超时（{idle:.0f}s 未响应），断开")
+                self._close_later(client, 4408, "heartbeat timeout")
+                self.detach(client)
+                continue
+            self._send(client, envelope("ping", {"interval": HEARTBEAT_INTERVAL}))
+
+    # ---------------- 上报判定 ----------------
+
+    def _pick_changed(self, current: dict[str, Any], plan: dict[str, dict[str, float]],
+                      last_value: dict[str, Any], last_ts: dict[str, int]) -> dict[str, Any]:
+        """
+        挑出「本次该上报的字段」。
+
+        判定规则与真实无线设备一致（对应 Zigbee 的三个上报参数）：
+          ① 变化量 >= reportableChange → 上报
+          ② 距上次上报 >= maxInterval  → 保活上报（即使没变化）
+          两者都受 minInterval 抑制（防止抖动导致高频上报）。
+
+        不满足条件的字段**不进入报文** —— 而不是像旧版那样把没变的旧值
+        再发一遍。这一点是「真实感」和「流量」两个指标同时改善的关键。
+        """
+        now = now_ms()
+        picked: dict[str, Any] = {}
+        for name, rule in plan.items():
+            if name not in current:
+                continue
+            since_ms = now - last_ts.get(name, 0)
+            if since_ms < rule["minInterval"] * 1000:
+                continue
+            previous = last_value.get(name)
+            changed = (previous is None
+                       or abs(float(current[name]) - float(previous)) >= rule["reportableChange"])
+            keepalive = since_ms >= rule["maxInterval"] * 1000
+            if changed or keepalive:
+                picked[name] = current[name]
+                last_value[name] = current[name]
+                last_ts[name] = now
+        return picked
+
     def _tick_telemetry(self) -> None:
-        hour_bias = math.sin(time.time() / 40)   # 对应原版 sin(Date.now()/40000)
+        self._sample_outdoor()
+        self._sample_devices()
+        self._flush_telemetry()
+        self._maybe_motion()
+        self._tick_device_heartbeat()
+
+    def _sample_outdoor(self) -> None:
+        """推进室外环境模型。它只在 snapshot / setup 里下发，不做高频广播。"""
         lo, hi = (-15, 45) if self.site["configured"] else (22, 36)
-        self.outdoor["temp"] = round1(clamp(self.outdoor["temp"] + (random.random() - 0.48) * 0.08, lo, hi))
-        self.outdoor["humidity"] = round1(clamp(self.outdoor["humidity"] + (random.random() - 0.5) * 0.35, 15, 98))
+        self.outdoor["temp"] = round1(clamp(
+            self.outdoor["temp"] + (random.random() - 0.48) * 0.08, lo, hi))
+        self.outdoor["humidity"] = round1(clamp(
+            self.outdoor["humidity"] + (random.random() - 0.5) * 0.35, 15, 98))
 
+    def _sample_devices(self) -> None:
+        """推进设备物理模型（只改内存值，是否上报由 _flush_telemetry 决定）。"""
+        hour_bias = math.sin(time.time() / 40)
         for device in self.devices.values():
-            if device.type != "ac":
-                continue
-            if device.state["power"]:
-                target = device.state["targetTemp"]
-                mode = device.state["mode"]
-                pull = 0.18 if mode == "heat" else 0.02 if mode == "fan" else 0.16
-                device.state["indoorTemp"] = round1(
-                    device.state["indoorTemp"] + (target - device.state["indoorTemp"]) * pull
-                    + (random.random() - 0.5) * 0.05
-                )
-            else:
-                device.state["indoorTemp"] = round1(
-                    device.state["indoorTemp"] + (self.outdoor["temp"] - device.state["indoorTemp"]) * 0.03
-                )
+            if device.type == "ac":
+                self._sample_ac(device)
+            elif device.type == "sensor":
+                self._sample_sensor(device, hour_bias)
 
+    def _sample_ac(self, device: Device) -> None:
+        """空调回风温度模型：开机时向设定温度靠拢，关机时向室外温度漂移。"""
+        s = device.reported
+        if s["power"]:
+            target = float(s["targetTemp"])
+            mode = s["mode"]
+            pull = 0.18 if mode == "heat" else 0.02 if mode == "fan" else 0.16
+            s["indoorTemp"] = round1(
+                float(s["indoorTemp"]) + (target - float(s["indoorTemp"])) * pull
+                + (random.random() - 0.5) * 0.05)
+        else:
+            # 关机后的自然回温很慢（房间有热容），不是一秒逼近室外。
+            # 用 0.006/s 而不是 0.03/s：后者会让室温在 30 秒内就追上室外，
+            # 于是传感器一路「合法地」高频上报，掩盖了上报阈值的效果。
+            s["indoorTemp"] = round1(
+                float(s["indoorTemp"])
+                + (self.outdoor["temp"] - float(s["indoorTemp"])) * 0.006)
+
+    def _sample_sensor(self, device: Device, hour_bias: float) -> None:
+        """
+        温湿度模型 + 器件特征。
+
+        与旧版相比多了四样真实器件一定会有的东西：
+          · 量化到分辨率（温度 0.1°C、湿度 1%）—— 真实传感器不会报 47.23%
+          · 电量缓慢下降（不是恒定 86%）
+          · 无线信号强度波动（rssi）
+          · **一阶滞后 + 亚阈值噪声** —— 读数按比例逼近目标值，不直接赋值
+
+        最后一条最要紧，也是最容易被忽略的：真实传感器的测量噪声一定
+        **小于**上报阈值（ReportableChange），否则设备会一直触发上报、
+        几天就把电池耗光 —— 这正是 Zigbee 设备把 ReportableChange
+        设在噪声之上的原因。旧版直接赋值 + 大噪声，「变化上报」形同虚设。
+        """
+        s = device.reported
+        ac = self.devices.get("ac.living") if device.room == "living" else (
+            self.devices.get("ac.bedroom") if device.room == "bedroom" else None)
+        base = (float(ac.reported["indoorTemp"]) if ac
+                else self.outdoor["temp"] - (1.2 if device.floor == 2 else 0.4))
+        cook = 1.6 if device.room == "kitchen" else 0
+        bath_light = self.devices.get("light.bath")
+        steam = 8 if (device.room == "bath" and bath_light
+                      and bath_light.reported["power"]) else 0
+
+        # 缓慢漂移：模拟开窗、人数变化等慢过程（分钟级），
+        # 让「真实值」自己会走，而不是靠噪声去凑变化。
+        drift = device.drift
+        for key, rate, span in (("temperature", 0.10, 1.4), ("humidity", 0.9, 9.0)):
+            step = (random.random() - 0.5) * rate * TELEMETRY_SAMPLE_INTERVAL / 60.0
+            drift[key] = clamp(drift.get(key, 0.0) + step, -span, span)
+
+        target_t = base + cook + hour_bias * 0.2 + drift["temperature"]
+        cur_t = float(s.get("temperature") or target_t)
+        # 一阶滞后：房间有热惯量。时间常数取 ~65s（0.015/s），
+        # 10 秒最多走完落差的 14% —— 于是正常情况下「10 秒内变化 < 0.2°C」，
+        # 上报阈值才真正起到过滤作用；而空调一开、落差拉大时又会如实上报。
+        # 噪声 0.05 远小于阈值 0.2，模拟「测量噪声必须低于上报阈值」这一器件事实。
+        s["temperature"] = quantize(
+            "sensor", "temperature",
+            cur_t + (target_t - cur_t) * 0.015 + (random.random() - 0.5) * 0.05)
+
+        target_h = clamp((56 if device.room == "bath" else 46) + steam
+                         + (self.outdoor["humidity"] - 55) * 0.15
+                         + drift["humidity"], 30, 90)
+        cur_h = float(s.get("humidity") or target_h)
+        # 湿度噪声 0.25 < 阈值 1.0；量化到 1% 后基本不会越过阈值
+        s["humidity"] = quantize(
+            "sensor", "humidity",
+            cur_h + (target_h - cur_h) * 0.012 + (random.random() - 0.5) * 0.25)
+
+        # 电量按「每天 0.1%」的速率放电（纽扣电池 + 低频上报的真实量级）
+        drain = BATTERY["drainPerDay"] * TELEMETRY_SAMPLE_INTERVAL / 86400.0
+        s["battery"] = round(max(0.0, float(s.get("battery") or 100) - drain), 1)
+        if float(s["battery"]) <= BATTERY["lowThreshold"]:
+            self.raise_fault(device.id, FAULT_CODES.LOW_BATTERY)
+
+        # 无线链路质量：小幅波动，模拟真实射频环境
+        s["rssi"] = int(clamp(float(s.get("rssi") or -55)
+                              + (random.random() - 0.5) * 2, -95, -30))
+
+    def _flush_telemetry(self) -> None:
+        """按上报参数筛选后广播。没有字段需要上报的设备，一条报文都不发。"""
         for device in self.devices.values():
-            if device.type != "sensor":
+            plan = REPORTING.get(device.type)
+            if not plan:
                 continue
-            ac = self.devices.get("ac.living") if device.room == "living" else (
-                self.devices.get("ac.bedroom") if device.room == "bedroom" else None)
-            base = ac.state["indoorTemp"] if ac else self.outdoor["temp"] - (1.2 if device.floor == 2 else 0.4)
-            cook = 1.6 if device.room == "kitchen" else 0
-            bath_light = self.devices.get("light.bath")
-            steam = 8 if (device.room == "bath" and bath_light and bath_light.state["power"]) else 0
-            device.state["temperature"] = round1(base + cook + hour_bias * 0.2 + (random.random() - 0.5) * 0.12)
-            device.state["humidity"] = round1(clamp(
-                (56 if device.room == "bath" else 46) + steam
-                + (self.outdoor["humidity"] - 55) * 0.15 + (random.random() - 0.5) * 0.8,
-                30, 90,
-            ))
-            device.state["comfort"] = _comfort(device.state["temperature"], device.state["humidity"])
+            picked = self._pick_changed(device.reported, plan,
+                                        device.last_reported, device.last_report_ts)
+            if not picked:
+                continue
             device.updated_at = now_ms()
-            self.broadcast(envelope("state", {
-                "deviceId": device.id, "type": device.type, "room": device.room,
-                "state": device.state, "online": True,
-            }))
+            device.last_seen_at = device.updated_at
+            self._broadcast_state(device, STATE_KIND.DELTA, fields=picked)
 
+    def _maybe_motion(self) -> None:
+        """
+        移动侦测。
+
+        旧版是每 2 秒抛一次 4% 的骰子、命中后保持 2.4 秒 —— 那既不是
+        「侦测」（没有触发源）也不是「保持」（时间短得不像 PIR）。
+        现在改为事件驱动：离家布防状态下，按「平均几分钟有人经过」的
+        频率产生事件，触发后保持 MOTION_HOLD_SECONDS 秒才复位。
+        """
         cam = self.devices.get("camera.living")
-        if cam and cam.state["armed"] and self.occupancy == "away" and random.random() < 0.04:
-            cam.state["motion"] = True
-            self.broadcast(envelope("state", {
-                "deviceId": cam.id, "type": cam.type, "room": cam.room,
-                "state": cam.state, "online": True,
-            }))
-            self.broadcast_event({
-                "level": "alarm", "source": cam.id,
-                "message": "客厅摄像头检测到移动（布防中）",
-            })
-            asyncio.create_task(self._clear_motion_after(cam.id, 2.4))
+        if cam is None or not cam.reported.get("armed") or cam.reported.get("motion"):
+            return
+        if self.occupancy != "away":
+            return
+        # 每秒触发概率 = 1 / 平均间隔，等价于泊松过程
+        probability = TELEMETRY_SAMPLE_INTERVAL / max(MOTION_MEAN_INTERVAL, 1.0)
+        if random.random() >= probability:
+            return
+
+        cam.reported["motion"] = True
+        cam.updated_at = now_ms()
+        self._broadcast_state(cam, STATE_KIND.DELTA, fields={"motion": True})
+        self.broadcast_event({
+            "level": "alarm", "source": cam.id,
+            "message": "客厅摄像头检测到移动（布防中）",
+            "detectionType": "pir", "confidence": 0.92,
+        })
+        asyncio.create_task(self._clear_motion_after(cam.id, MOTION_HOLD_SECONDS))
 
     async def _clear_motion_after(self, device_id: str, seconds: float) -> None:
         try:
@@ -1267,13 +2231,94 @@ class Gateway:
         except asyncio.CancelledError:
             return
         cam = self.devices.get(device_id)
-        if cam is None:
+        if cam is None or not cam.reported.get("motion"):
             return
-        cam.state["motion"] = False
-        self.broadcast(envelope("state", {
-            "deviceId": cam.id, "type": cam.type, "room": cam.room,
-            "state": cam.state, "online": True,
+        cam.reported["motion"] = False
+        cam.updated_at = now_ms()
+        self._broadcast_state(cam, STATE_KIND.DELTA, fields={"motion": False})
+
+    # ---------------- 在线检测 ----------------
+
+    def _tick_device_heartbeat(self) -> None:
+        """
+        设备心跳探测。
+
+        旧版把 online 硬编码为 True，全项目没有一处改它 ——
+        设备影子于是退化成内存变量：设备拔了电，界面还显示在线。
+        现在每个设备按自己的心跳周期被探测，连续 offlineThreshold 次
+        没有回应就判定离线，并广播一次状态变化。
+        """
+        now = now_ms()
+        for device in self.devices.values():
+            behavior = device.behavior()
+            period = behavior["heartbeatInterval"] * 1000
+            if now - device.last_probe_at < period:
+                continue
+            device.last_probe_at = now
+
+            if device.id in self._simulated_offline:
+                # 仿真：该设备不回应探测
+                device.missed_heartbeats += 1
+            else:
+                device.missed_heartbeats = 0
+                device.last_seen_at = now
+
+            limit = behavior["offlineThreshold"]
+            if device.online and device.missed_heartbeats >= limit:
+                self._set_online(device, False, reason="心跳超时")
+            elif not device.online and device.missed_heartbeats == 0:
+                self._set_online(device, True, reason="心跳恢复")
+
+    def _set_online(self, device: Device, online: bool, *, reason: str = "") -> None:
+        """切换在线状态并广播。只在状态**真的变化**时才产生报文。"""
+        if device.online == online:
+            return
+        device.online = online
+        device.updated_at = now_ms()
+        self._broadcast_state(device, STATE_KIND.FULL)
+        self.broadcast_event({
+            "level": "ok" if online else "warn",
+            "source": device.id,
+            "message": (f"{device.name} 已恢复在线" if online else f"{device.name} 已离线")
+                       + (f"（{reason}）" if reason else ""),
+        })
+
+    def raise_fault(self, device_id: str, code: str) -> None:
+        """
+        上报设备故障。
+
+        真实设备的故障也是走事件通道推给上层平台的，
+        而不是等平台来轮询 —— 轮询查不出「刚才闪过一次故障」。
+        """
+        device = self.devices.get(device_id)
+        if device is None or code in device.faults:
+            return
+        severity, label = FAULT_LABELS.get(code, ("warn", code))
+        info = {"code": code, "severity": severity, "message": label, "since": now_ms()}
+        device.faults[code] = info
+        self.broadcast(envelope(MSG.FAULT, {
+            "deviceId": device_id,
+            "faultCode": code,
+            "severity": severity,
+            "message": label,
+            "since": info["since"],
         }))
+        self.broadcast_event({
+            "level": severity, "source": device_id, "message": f"故障：{label}",
+        })
+
+    def clear_fault(self, device_id: str, code: str | None = None) -> None:
+        """清除故障（故障恢复）。"""
+        device = self.devices.get(device_id)
+        if device is None:
+            return
+        removed = [code] if code else list(device.faults)
+        for key in removed:
+            if device.faults.pop(key, None) is not None:
+                self.broadcast_event({
+                    "level": "ok", "source": device_id,
+                    "message": f"故障已恢复：{FAULT_LABELS.get(key, ('', key))[1]}",
+                })
 
     def _tick_video(self) -> None:
         self._signal_stream(self.devices.get("camera.living"), "camera")
@@ -1333,18 +2378,7 @@ class Gateway:
             "occupancy": self.occupancy,
             "outdoor": self.outdoor,
             "site": self.site,
-            "devices": [
-                {
-                    "id": d.id, "type": d.type, "name": d.name, "room": d.room, "floor": d.floor,
-                    "capabilities": list(d.capabilities),
-                    "channel": d.channel or None,
-                    "stream": self.hub.info(d.channel) if d.channel else None,
-                    "online": d.online,
-                    "updatedAt": d.updated_at,
-                    "state": d.state,
-                }
-                for d in self.devices.values()
-            ],
+            "devices": [self._device_snapshot(d) for d in self.devices.values()],
             "streams": self.hub.list(),
             "lock": {
                 "source": self.video_source.status().as_dict(),
@@ -1355,6 +2389,39 @@ class Gateway:
             "scenes": SCENES,
             "recentEvents": self.events[:12],
         }
+
+    def _device_snapshot(self, d: Device) -> dict[str, Any]:
+        """
+        单台设备的快照条目。
+
+        state 里放的是**设备上报值**（reported）；传感器另附 derived。
+        这里刻意不把派生量塞进 state —— 全量快照和增量报文的结构必须一致，
+        否则客户端得为两条路径各写一套解析逻辑。
+        """
+        item: dict[str, Any] = {
+            "id": d.id, "type": d.type, "name": d.name, "room": d.room, "floor": d.floor,
+            "capabilities": list(d.capabilities),
+            "channel": d.channel or None,
+            "stream": self.hub.info(d.channel) if d.channel else None,
+            "online": d.online,
+            "lastSeenAt": d.last_seen_at,
+            "firmware": d.firmware,
+            "updatedAt": d.updated_at,
+            "state": dict(d.reported),
+        }
+        if d.desired and d.delta():
+            # 有待执行/未达成的期望值时一并给出，便于客户端显示「正在执行」
+            item["desired"] = dict(d.desired)
+            item["delta"] = d.delta()
+        if d.faults:
+            item["faults"] = list(d.faults.values())
+        if d.type == "sensor":
+            item["derived"] = derived.sensor_derived(
+                float(d.reported.get("temperature") or 0.0),
+                float(d.reported.get("humidity") or 0.0),
+                at=d.updated_at,
+            )
+        return item
 
     def push_snapshot(self, client: Client) -> None:
         self._send(client, envelope("snapshot", self.snapshot()))
@@ -1374,12 +2441,43 @@ class Gateway:
         self.seq += 1
 
     def broadcast(self, msg: dict[str, Any] | str) -> None:
+        """
+        广播给所有**已认证**的客户端。
+
+        未认证连接被排除在外是刻意的：设备影子、事件流、场景状态都属于
+        「家里正在发生什么」，不该让一个还没出示令牌的连接读到。
+        """
         data = msg if isinstance(msg, str) else json_dumps(msg)
         for client in list(self.clients):
+            if not client.authed:
+                continue
             client.push(data)
 
     def _send(self, client: Client, msg: dict[str, Any]) -> None:
+        """点对点下发。不检查认证状态 —— 认证流程本身就要用这个通道。"""
         client.push(json_dumps(msg))
+
+    def stats(self) -> dict[str, Any]:
+        """运行统计，供 /health 与 /api/diagnostics 使用。"""
+        return {
+            "commandsTotal": self._commands_total,
+            "rateLimited": self._rate_limited,
+            "clients": len(self.clients),
+            "authedClients": sum(1 for c in self.clients if c.authed),
+            "outboxDropped": sum(c.dropped for c in self.clients),
+            "outboxCoalesced": sum(c.coalesced for c in self.clients),
+            "devices": {
+                d.id: {
+                    "online": d.online,
+                    "lastSeenAt": d.last_seen_at,
+                    "rssi": d.reported.get("rssi"),
+                    "battery": d.reported.get("battery"),
+                    "faults": list(d.faults),
+                    "pendingDelta": d.delta() or None,
+                }
+                for d in self.devices.values()
+            },
+        }
 
     # ---------------- 天气 ----------------
 
@@ -1423,14 +2521,6 @@ class Gateway:
             "sunset": sunset_list[0] if sunset_list else None,
             "name": "",
         }
-
-
-def _comfort(temperature: float, humidity: float) -> str:
-    if 23 <= temperature <= 27 and 40 <= humidity <= 60:
-        return "舒适"
-    if temperature > 28 or humidity > 70:
-        return "偏闷"
-    return "一般"
 
 
 def _decode_face_image(data: bytes) -> Image.Image:

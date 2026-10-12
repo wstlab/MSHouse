@@ -10,6 +10,50 @@ host = "0.0.0.0"
 port = 8080
 
 # ------------------------------------------------------------------ #
+# 鉴权（v2.0 新增）
+#
+# 为什么不给默认口令：早期版本把口令明文写在 model.py 并导出到前端 JS，
+# 任何打开网页的人按 F12 就能读到；/ws 更是完全不校验，能连上就能开锁。
+#
+# 现在：
+#   token                访问令牌。留空时网关会在启动日志中自动生成一个并打印，
+#                        抄进这里即可固定下来。环境变量 MSHOUSE_TOKEN 优先。
+#   setup_password_hash  「初始化设置」口令的 PBKDF2 哈希。留空时启动会生成
+#                        一次性随机口令并打印（只打印一次），请及时保存。
+#                        生成方式：python -m server.hash_password
+#   allowed_origins      允许跨域访问的来源白名单（用于视频流）。
+#                        留空 = 仅同源。填 "*" 表示不限制（不推荐）。
+#   allow_anonymous      true 时跳过令牌校验，仅供课堂演示；启动会打印警告。
+#   stream_sign_ttl      视频流签名 URL 有效期（秒），30~86400。
+# ------------------------------------------------------------------ #
+[security]
+token = "quickform"
+setup_password_hash = "pbkdf2_sha256$200000$uE8tX21PMqFEbgz2o36Xug==$FyN4wq26wHBP/wANJPDVCM+WQD9QeCU9ER82ThLlBGw="
+allowed_origins = []
+allow_anonymous = false
+stream_sign_ttl = 300
+
+# ------------------------------------------------------------------ #
+# 设备仿真（v2.0 新增）
+#
+# 用于在不拔网线、不损坏设备的前提下演示异常流程。
+#   simulate_offline    启动后保持离线的设备 ID 列表（演示在线检测）
+#   simulate_fault      启动后立即注入的故障 {设备ID = 故障码}（演示故障上报）
+#   state_persist       设备状态持久化文件；留空表示只存内存（重启即丢）
+#   command_rate_limit  每连接命令限流（条/秒）
+#   coalesce_window_ms  同设备同字段的抖动合并窗口（毫秒）
+# ------------------------------------------------------------------ #
+[devices]
+simulate_offline = []
+state_persist = ""
+command_rate_limit = 10.0
+coalesce_window_ms = 200
+
+# [devices.simulate_fault]
+# "light.kitchen" = "LAMP_BURNOUT"
+# "ac.living" = "FILTER_DIRTY"
+
+# ------------------------------------------------------------------ #
 # 摄像头推流端口配置
 #
 # port = 0   复用主服务端口，画面地址为：

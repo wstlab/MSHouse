@@ -10,10 +10,7 @@
  *    这样前后端永远共用同一份定义，不会出现两处漂移。
  */
 
-export const PROTOCOL_VERSION = "1.0";
-
-/** 初始化设置口令。教学演示用，真实项目应换成服务端哈希校验。 */
-export const SETUP_PASSWORD = "villa";
+export const PROTOCOL_VERSION = "2.0";
 
 export const MSG = {
   HELLO: "hello",
@@ -30,6 +27,84 @@ export const MSG = {
   SETUP: "setup",
   SETUP_AUTH: "setupAuth",
   FACE_ENROLL: "faceEnroll",
+  RESYNC: "resync",
+  FAULT: "fault",
+  OTA: "ota",
+};
+
+/** state 报文的语义：delta 增量 / full 全量 / confirmed 执行确认 */
+export const STATE_KIND = {
+  DELTA: "delta",
+  FULL: "full",
+  CONFIRMED: "confirmed",
+};
+
+/** 结构化错误码。客户端按 code 分支，不要去匹配中文文案。 */
+export const ERROR_CODES = {
+  BAD_JSON: "BAD_JSON",
+  BAD_ENVELOPE: "BAD_ENVELOPE",
+  UNKNOWN_TYPE: "UNKNOWN_TYPE",
+  UNAUTHORIZED: "UNAUTHORIZED",
+  FORBIDDEN: "FORBIDDEN",
+  PROTOCOL_MISMATCH: "PROTOCOL_MISMATCH",
+  DEVICE_NOT_FOUND: "DEVICE_NOT_FOUND",
+  ACTION_NOT_SUPPORTED: "ACTION_NOT_SUPPORTED",
+  UNSUPPORTED_CAPABILITY: "UNSUPPORTED_CAPABILITY",
+  INVALID_PARAM: "INVALID_PARAM",
+  READ_ONLY_DEVICE: "READ_ONLY_DEVICE",
+  DEVICE_OFFLINE: "DEVICE_OFFLINE",
+  DEVICE_TIMEOUT: "DEVICE_TIMEOUT",
+  RATE_LIMITED: "RATE_LIMITED",
+  SETUP_DENIED: "SETUP_DENIED",
+  INTERNAL: "INTERNAL",
+};
+
+/** THI 温湿指数分级（机器可读；中文映射在 ui.js 里） */
+export const COMFORT = {
+  COOL: "cool",
+  COMFORTABLE: "comfortable",
+  WARM: "warm",
+  HOT: "hot",
+};
+
+/** 上报参数（对应 Zigbee 的 ReportableChange / Min / MaxReportingInterval） */
+export const REPORTING = {
+  "sensor": {
+    "temperature": {
+      "reportableChange": 0.2,
+      "minInterval": 10,
+      "maxInterval": 600
+    },
+    "humidity": {
+      "reportableChange": 1.0,
+      "minInterval": 10,
+      "maxInterval": 600
+    },
+    "battery": {
+      "reportableChange": 1.0,
+      "minInterval": 300,
+      "maxInterval": 3600
+    },
+    "rssi": {
+      "reportableChange": 3.0,
+      "minInterval": 60,
+      "maxInterval": 1800
+    }
+  },
+  "ac": {
+    "indoorTemp": {
+      "reportableChange": 0.3,
+      "minInterval": 15,
+      "maxInterval": 900
+    }
+  },
+  "lock": {
+    "battery": {
+      "reportableChange": 1.0,
+      "minInterval": 300,
+      "maxInterval": 3600
+    }
+  }
 };
 
 export const ROOMS = [

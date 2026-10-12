@@ -65,10 +65,14 @@ class Channel:
 
 
 class StreamHub:
-    def __init__(self, fps: int = 8, idle_fps: int = 2, quality: int = 72) -> None:
+    def __init__(self, fps: int = 8, idle_fps: int = 2, quality: int = 72,
+                 allowed_origins: tuple[str, ...] = ()) -> None:
         self.fps = fps
         self.idle_fps = idle_fps
         self.quality = quality
+        # 允许跨域嵌入画面的来源白名单。空表示仅同源 ——
+        # 旧版无条件回 *，等于把门锁画面开放给任意网站嵌入。
+        self.allowed_origins = tuple(allowed_origins)
         self.channels: dict[str, Channel] = {}
 
     # ---------------- 通道管理 ----------------
@@ -136,16 +140,21 @@ class StreamHub:
         """处理 GET /?stream=<channel>：不存在 → 404，存在 → multipart 长连接。"""
         ch = self.get(channel)
         if ch is None:
-            available = ", ".join(self.channels)
-            return PlainTextResponse(
-                f"未知的视频通道：{channel}\n可用通道：{available}\n", status_code=404
-            )
+            # 不再回显「可用通道」列表：那等于把设备拓扑告诉了一个
+            # 尚未通过鉴权的请求方。要提示就在鉴权通过后提示。
+            return PlainTextResponse(f"未知的视频通道：{channel}\n", status_code=404)
         headers = {
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
-            "Access-Control-Allow-Origin": "*",
             "X-Stream-Channel": ch.channel,
         }
+        # CORS 白名单。
+        # 旧版无条件回 `Access-Control-Allow-Origin: *`，等于允许任意网站
+        # 把这个流嵌进自己的页面 —— 门锁画面就这样被第三方页面看走了。
+        origin = request.headers.get("origin")
+        if origin and self._origin_allowed(origin):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
         if request.method == "HEAD":
             return Response(
                 status_code=200,
@@ -156,6 +165,14 @@ class StreamHub:
             media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY}",
             headers=headers,
         )
+
+    def _origin_allowed(self, origin: str) -> bool:
+        """按配置的来源白名单判断是否回显 CORS 头。空名单 = 仅同源。"""
+        if not self.allowed_origins:
+            return False
+        if "*" in self.allowed_origins:
+            return True
+        return origin in self.allowed_origins
 
     async def _mjpeg(self, ch: Channel, request: Request):
         """每个订阅者一个生成器 + 一个有界队列，队列满即丢帧（背压）。"""

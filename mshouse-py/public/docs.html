@@ -155,7 +155,7 @@
     .ws-tester label.inline { display: inline-block; margin: 0 6px 0 0; }
     .ws-tester textarea {
       width: 100%;
-      height: 90px;
+      height: 150px;
       background: #18241f;
       border: 1px solid var(--line);
       color: var(--ink);
@@ -266,10 +266,22 @@
 
     <h3>3.2 首次使用</h3>
     <p>
-      点击顶部「设置」按钮，输入口令 <code>villa</code> 后可写入住宅位置（经纬度、地点名）。
+      点击顶部「设置」按钮，输入<b>初始化口令</b>后可写入住宅位置（经纬度、地点名）。
       写入后网关会按当地天气预报初始化室外温湿度，并影响室内传感器与空调的初始值。
       你也可以在设置里把大门锁画面来源切换为：静态画面（默认，按天气切换）、本机摄像头、网络视频流（RTSP / HTTP-MJPEG）。
     </p>
+    <div class="note">
+      <b>口令从哪来</b>：v2.0 起口令不再以明文出现在源码或网页里。
+      首次启动网关时，控制台会打印一个随机口令（只打印一次，请立即保存）；
+      也可以运行 <code>python -m server.hash_password</code> 自定义，
+      把输出的哈希填进 <code>config.toml</code> 的 <code>security.setup_password_hash</code>。
+      网关只存哈希，事后无法反推。
+    </div>
+    <div class="note">
+      <b>连接也需要令牌</b>：WebSocket 建链时必须携带访问令牌（同样打印在启动日志里，
+      或写入 <code>config.toml</code> 的 <code>security.token</code>）。
+      顶部「设置」里填一次即可，之后记在浏览器本地。
+    </div>
 
     <h3>3.3 日常交互</h3>
     <ul>
@@ -294,12 +306,19 @@
 
     <h2 id="ws">4. WebSocket 接口</h2>
     <p>
-      端点：<code>ws://&lt;host&gt;:&lt;port&gt;/ws</code>。建链后服务端主动推 <code>hello</code>、<code>snapshot</code>、<code>event</code>。
+      端点：<code>ws://&lt;host&gt;:&lt;port&gt;/ws</code>。<b>需要访问令牌</b>（通过子协议
+      <code>bearer.&lt;token&gt;</code>、查询串 <code>?token=</code> 或首帧 <code>hello</code> 携带）。
+      建链并认证后服务端主动推 <code>hello</code>、<code>snapshot</code>、<code>event</code>。
       所有消息使用同一信封：
     </p>
-    <pre><code>{ "v": "1.0", "type": "command", "id": "ui-xxx", "ts": 1796000000000,
+    <pre><code>{ "v": "2.0", "type": "command", "id": "ui-xxx", "ts": 1796000000000,
   "payload": { "deviceId": "light.living", "action": "set",
                "params": { "power": true, "brightness": 80 } } }</code></pre>
+    <p>
+      控制命令走<b>两阶段</b>：网关先回 <code>ack</code>（<code>status: "ACCEPTED"</code>，表示已受理），
+      设备真正执行后再广播 <code>state</code>（<code>stateKind: "confirmed"</code>）。
+      完整说明见仓库内的 <code>docs/INTEGRATION.md</code>。
+    </p>
 
     <h3>4.1 控制设备</h3>
     <table>
@@ -317,13 +336,19 @@
     <h3>4.3 关键消息类型</h3>
     <table>
       <tr><th>方向</th><th>type</th><th>作用</th></tr>
+      <tr><td>S→C</td><td><code>hello</code></td><td>握手（网关标识、协议版本、是否已认证）</td></tr>
       <tr><td>S→C</td><td><code>snapshot</code></td><td>全量设备影子、场景、站点、天气、最近事件</td></tr>
-      <tr><td>S→C</td><td><code>state</code></td><td>单设备增量更新，所有客户端广播</td></tr>
+      <tr><td>S→C</td><td><code>state</code></td><td>单设备更新，带 <code>stateKind</code>（delta / full / confirmed）与 <code>seq</code></td></tr>
       <tr><td>S→C</td><td><code>event</code></td><td>日志与安防事件</td></tr>
-      <tr><td>S→C</td><td><code>ack</code></td><td>命令回执，<code>ref</code> 关联请求 <code>id</code></td></tr>
+      <tr><td>S→C</td><td><code>ack</code></td><td>命令回执，<code>ref</code> 关联请求 <code>id</code>，错误为结构化 <code>errorInfo</code></td></tr>
       <tr><td>S→C</td><td><code>video</code></td><td>流信令（通道、推流状态、云台、识别结果）</td></tr>
+      <tr><td>S→C</td><td><code>fault</code></td><td>设备故障上报（灯珠损坏、滤网脏堵…）</td></tr>
+      <tr><td>S→C</td><td><code>ota</code></td><td>固件升级进度（下载 / 校验 / 安装 / 重启 / 生效）</td></tr>
       <tr><td>S→C</td><td><code>faceEnroll</code></td><td>陌生脸登记询问</td></tr>
+      <tr><td>S→C</td><td><code>ping</code></td><td>服务端心跳，客户端须回 <code>pong</code></td></tr>
       <tr><td>C→S</td><td><code>command / scene / snapshot / setup / ping</code></td><td>控制、切场景、拉全量、写位置、心跳</td></tr>
+      <tr><td>C→S</td><td><code>resync</code></td><td>序号跳号后请求全量对齐</td></tr>
+      <tr><td>C→S</td><td><code>ota</code></td><td>发起固件升级</td></tr>
     </table>
 
     <h3>4.4 视频流</h3>
@@ -344,6 +369,7 @@
     <div class="ws-tester">
       <div class="ws-row">
         <input type="text" id="wsUrl" placeholder="ws://localhost:8080/ws" />
+        <input type="password" id="wsToken" placeholder="访问令牌" style="max-width:180px" />
         <button id="wsConnect" class="primary">连接</button>
         <button id="wsDisconnect">断开</button>
         <span class="meta" id="wsStatus">未连接</span>
@@ -356,8 +382,8 @@
         <button id="wsSend" class="primary">发送</button>
         <button id="wsClearLog">清空日志</button>
       </div>
-      <label for="wsPreview">自动生成的报文</label>
-      <pre id="wsPreview"><code>请先选择设备和动作</code></pre>
+      <label for="wsPreview">自动生成的报文（可直接修改后发送）</label>
+      <textarea id="wsPreview" spellcheck="false">请先选择设备和动作</textarea>
       <div class="ws-log" id="wsLog"></div>
     </div>
 
@@ -443,7 +469,8 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
       }
 
       function envelope(type, payload) {
-        return { v: "1.0", type, id: nextId(), ts: Date.now(), payload };
+        // v 必须与网关主版本一致，否则被以 PROTOCOL_MISMATCH 拒绝（close 4426）
+        return { v: "2.0", type, id: nextId(), ts: Date.now(), payload };
       }
 
       function log(cls, text) {
@@ -533,7 +560,7 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
 
       function updatePreview() {
         const msg = buildMessage();
-        wsPreview.innerHTML = msg ? '<code>' + JSON.stringify(msg, null, 2) + '</code>' : '<code>请先选择设备和动作</code>';
+        wsPreview.value = msg ? JSON.stringify(msg, null, 2) : '请先选择设备和动作';
       }
 
       wsDevice.addEventListener('change', () => {
@@ -547,19 +574,32 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
         if (ws) { log('err', '已存在连接，请先断开'); return; }
         const url = wsUrl.value.trim();
         if (!url) return;
+        const token = document.getElementById('wsToken').value.trim();
         setStatus('连接中…');
-        ws = new WebSocket(url);
+        // 令牌搭子协议的车：浏览器的 WebSocket 构造函数没法自定义请求头
+        const protocols = token ? ['mshouse.v1', `bearer.${token}`] : ['mshouse.v1'];
+        ws = new WebSocket(url, protocols);
         ws.onopen = () => { setStatus('已连接', true); };
         ws.onmessage = (e) => {
           try {
             const msg = JSON.parse(e.data);
+            // 服务端心跳必须回，否则 3 次未响应会被以 4408 断开
+            if (msg.type === 'ping') {
+              ws.send(JSON.stringify(envelope('pong', {})));
+              return;
+            }
             log('in', `← ${msg.type}${msg.id ? ' · ' + msg.id : ''}\n` + JSON.stringify(msg, null, 2));
           } catch (err) {
             log('in', '← ' + e.data);
           }
         };
         ws.onerror = () => { setStatus('连接错误', false); log('err', 'WebSocket 发生错误'); };
-        ws.onclose = () => { setStatus('已断开', false); ws = null; log('err', '连接已关闭'); };
+        ws.onclose = (ev) => {
+          const reason = { 4401: '未认证（令牌缺失或错误）', 4408: '心跳超时', 4426: '协议版本不匹配' }[ev.code];
+          setStatus('已断开', false);
+          ws = null;
+          log('err', reason ? `连接已关闭：${reason}` : '连接已关闭');
+        };
       });
 
       document.getElementById('wsDisconnect').addEventListener('click', () => {
@@ -570,8 +610,15 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
 
       document.getElementById('wsSend').addEventListener('click', () => {
         if (!ws || ws.readyState !== 1) { log('err', 'WebSocket 未连接'); return; }
-        const msg = buildMessage();
-        if (!msg) { log('err', '请先选择设备和动作'); return; }
+        // 优先发送用户在文本框里编辑过的报文，便于手工调整参数测试
+        let msg;
+        try {
+          msg = JSON.parse(wsPreview.value);
+        } catch (e) {
+          log('err', '报文中的 JSON 无法解析：' + e.message);
+          return;
+        }
+        if (!msg || !msg.type) { log('err', '报文缺少 type 字段'); return; }
         ws.send(JSON.stringify(msg));
         log('out', `→ ${msg.type}\n` + JSON.stringify(msg, null, 2));
       });

@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import security
 from .config import AppConfig, load_config
-from .gateway import Client, Gateway
+from .gateway import AUTH_GRACE_SECONDS, Client, Gateway
+from .model import ERROR_CODES, FAULT_CODES, PROTOCOL_VERSION
 
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / "public"
@@ -92,7 +96,65 @@ gateway = Gateway(
     },
     stream_fps=CONFIG.channel_fps(),
     lock_options=_build_lock_options(CONFIG),
+    security_config=CONFIG.security,
+    device_config=CONFIG.devices,
 )
+
+
+def _startup_banner() -> None:
+    """
+    启动提示。
+
+    首次启动时把自动生成的令牌与一次性口令打印出来 ——
+    这是使用者拿到凭据的唯一机会（口令只存哈希，事后无法反推）。
+    """
+    sec = CONFIG.security
+    print("=" * 62)
+    print("MSHouse 镜像家居 · 网关已启动")
+    print("=" * 62)
+    if sec.allow_anonymous:
+        print("⚠️  安全警告：security.allow_anonymous = true")
+        print("    当前**任何人都能连接并控制设备**，仅限课堂演示使用。")
+    elif sec.token:
+        print(f"访问令牌：{sec.token}")
+        print("  请把它填进 config.toml 的 security.token 以固定下来；")
+        print("  也可以用环境变量 MSHOUSE_TOKEN 覆盖。")
+    if sec.generated_password:
+        print(f"初始化设置口令（本次启动生成，仅显示一次）：{sec.generated_password}")
+        print("  请立即保存。要换固定口令，运行：python -m server.hash_password")
+        print("  然后把输出的哈希填进 config.toml 的 security.setup_password_hash。")
+    if CONFIG.devices.simulate_offline:
+        print(f"仿真：以下设备保持离线 -> {', '.join(CONFIG.devices.simulate_offline)}")
+    if CONFIG.devices.simulate_fault:
+        for dev_id, code in CONFIG.devices.simulate_fault.items():
+            print(f"仿真：{dev_id} 注入故障 {code}")
+    print("=" * 62)
+
+
+def _extract_token(ws: WebSocket) -> str:
+    """
+    从握手中提取访问令牌。
+
+    三个入口覆盖不同客户端的能力差异：
+      ① 子协议头 `Sec-WebSocket-Protocol: mshouse.v1, bearer.<token>`
+         —— 浏览器的 WebSocket 构造函数没法自定义请求头，子协议是它唯一能传凭据的地方
+      ② 查询串 ?token=<token>  —— 命令行工具与调试脚本最顺手
+      ③ 首帧 hello 携带 token —— 某些 SDK 只能连上之后才发得出数据
+    """
+    proto = ws.headers.get("sec-websocket-protocol") or ""
+    for item in proto.split(","):
+        item = item.strip()
+        if item.startswith("bearer."):
+            return item[len("bearer."):]
+    token = ws.query_params.get("token")
+    return str(token) if token else ""
+
+
+def _offered_subprotocol(ws: WebSocket) -> str | None:
+    """回显客户端声明的 mshouse.v1 子协议（浏览器要求服务端回显才认）。"""
+    proto = ws.headers.get("sec-websocket-protocol") or ""
+    names = [p.strip() for p in proto.split(",") if p.strip()]
+    return "mshouse.v1" if "mshouse.v1" in names else None
 
 
 def build_stream_app(channel: str) -> FastAPI:
@@ -151,7 +213,7 @@ async def lifespan(app: FastAPI):
         await gateway.dispose()
 
 
-app = FastAPI(title="MSHouse Gateway", version="1.0", lifespan=lifespan)
+app = FastAPI(title="MSHouse Gateway", version=PROTOCOL_VERSION, lifespan=lifespan)
 
 
 # ------------------------------------------------------------------ #
@@ -162,8 +224,52 @@ app = FastAPI(title="MSHouse Gateway", version="1.0", lifespan=lifespan)
 @app.get("/")
 async def index(request: Request, stream: str | None = None):
     if stream:
+        # 流通道鉴权。
+        # <img src> 没法自定义请求头，所以除了令牌，还支持一次性签名 URL
+        # （?exp=&sig=，由 /api/stream-url 签发）—— 这是真实摄像头
+        # 也普遍采用的方案（HLS/RTSP-over-HTTP 的临时地址同源同理）。
+        if not _stream_allowed(request, stream):
+            return PlainTextResponse("未授权：视频通道需要有效令牌或签名\n", status_code=401)
         return gateway.hub.attach(request, stream)
     return FileResponse(PUBLIC / "index.html")
+
+
+def _stream_allowed(request: Request, channel: str) -> bool:
+    if CONFIG.security.allow_anonymous:
+        return True
+    token = request.query_params.get("token") or ""
+    if not token:
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+    if gateway.check_access_token(token):
+        return True
+    try:
+        expires = int(request.query_params.get("exp") or 0)
+    except (TypeError, ValueError):
+        return False
+    sig = request.query_params.get("sig") or ""
+    ok, _reason = security.verify_stream(channel, expires, sig, gateway.token)
+    return ok
+
+
+@app.get("/api/stream-url")
+async def stream_url(request: Request, channel: str):
+    """签发一次性流地址（供 <img> 这类无法带请求头的场景使用）。"""
+    if not CONFIG.security.allow_anonymous:
+        token = request.query_params.get("token") or ""
+        if not gateway.check_access_token(token):
+            return JSONResponse({"ok": False, "code": ERROR_CODES.UNAUTHORIZED,
+                                 "message": "需要有效令牌"}, status_code=401)
+    expires = int(time.time()) + CONFIG.security.stream_sign_ttl
+    sig = security.sign_stream(channel, expires, gateway.token)
+    return JSONResponse({
+        "ok": True,
+        "channel": channel,
+        "url": f"/?stream={channel}&exp={expires}&sig={sig}",
+        "expiresAt": expires,
+        "ttl": CONFIG.security.stream_sign_ttl,
+    })
 
 
 @app.get("/streams")
@@ -174,14 +280,105 @@ async def streams():
 
 @app.get("/health")
 async def health():
+    stats = gateway.stats()
     return JSONResponse({
         "ok": True,
         "service": "mshouse",
         "runtime": "python",
-        "version": "1.0",
-        "clients": len(gateway.clients),
+        "version": PROTOCOL_VERSION,
+        "clients": stats["clients"],
+        "authedClients": stats["authedClients"],
         "streams": gateway.hub.list(),
         "lock": gateway.lock_status(),
+        "devices": stats["devices"],
+        "backpressure": {
+            "outboxDropped": stats["outboxDropped"],
+            "outboxCoalesced": stats["outboxCoalesced"],
+        },
+        "commands": {
+            "total": stats["commandsTotal"],
+            "rateLimited": stats["rateLimited"],
+        },
+    })
+
+
+@app.post("/api/simulate")
+async def simulate(request: Request):
+    """
+    仿真控制：让设备离线/恢复、注入或清除故障。
+
+    仅用于教学演示与测试（真实设备当然不会提供这种接口）。
+    它本身就是敏感操作 —— 所以与命令走同一套令牌校验，
+    不能因为「只是个演示接口」就放行。
+    """
+    if not CONFIG.security.allow_anonymous:
+        token = request.query_params.get("token") or ""
+        if not gateway.check_access_token(token):
+            return JSONResponse({"ok": False, "code": ERROR_CODES.UNAUTHORIZED,
+                                 "message": "需要有效令牌"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "code": ERROR_CODES.BAD_JSON,
+                             "message": "请求体不是合法 JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "code": ERROR_CODES.INVALID_PARAM,
+                             "message": "请求体必须是对象"}, status_code=400)
+
+    device_id = str(body.get("deviceId") or "")
+    device = gateway.devices.get(device_id)
+    if device is None:
+        return JSONResponse({"ok": False, "code": ERROR_CODES.DEVICE_NOT_FOUND,
+                             "message": f"设备不存在：{device_id}"}, status_code=404)
+
+    action = str(body.get("action") or "")
+    if action == "offline":
+        gateway._simulated_offline.add(device_id)
+        device.missed_heartbeats = 99
+        gateway._set_online(device, False, reason="仿真置为离线")
+    elif action == "online":
+        gateway._simulated_offline.discard(device_id)
+        device.missed_heartbeats = 0
+        device.last_seen_at = int(time.time() * 1000)
+        gateway._set_online(device, True, reason="仿真置为在线")
+    elif action == "fault":
+        code = str(body.get("faultCode") or "")
+        if code not in vars(FAULT_CODES).values():
+            return JSONResponse({"ok": False, "code": ERROR_CODES.INVALID_PARAM,
+                                 "message": f"未知故障码：{code}"}, status_code=400)
+        gateway.raise_fault(device_id, code)
+    elif action == "clearFault":
+        gateway.clear_fault(device_id, body.get("faultCode") or None)
+    else:
+        return JSONResponse({"ok": False, "code": ERROR_CODES.INVALID_PARAM,
+                             "message": "action 必须是 offline/online/fault/clearFault"},
+                            status_code=400)
+
+    return JSONResponse({
+        "ok": True, "deviceId": device_id, "action": action,
+        "online": device.online, "faults": list(device.faults),
+    })
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """诊断接口：最近事件、故障、限流与背压统计。"""
+    return JSONResponse({
+        "ok": True,
+        "version": PROTOCOL_VERSION,
+        "stats": gateway.stats(),
+        "faults": {
+            d.id: list(d.faults.values())
+            for d in gateway.devices.values() if d.faults
+        },
+        "recentEvents": gateway.events[:40],
+        "config": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "commandRateLimit": CONFIG.devices.command_rate_limit,
+            "coalesceWindowMs": CONFIG.devices.coalesce_window_ms,
+            "statePersist": CONFIG.devices.state_persist or None,
+            "allowAnonymous": CONFIG.security.allow_anonymous,
+        },
     })
 
 
@@ -213,19 +410,58 @@ async def clear_lock_face():
 # ------------------------------------------------------------------ #
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
-    await ws.accept()
+    """
+    WebSocket 接入。
+
+    与旧版最大的区别：**连上不等于能用**。
+    旧版 `await ws.accept()` 之后不校验任何东西，任何人发一条
+    {"action":"unlock"} 就能开门。现在握手阶段先取令牌，取不到就只给
+    一条 hello，要求客户端在宽限期内补交。
+    """
+    token = _extract_token(ws)
+    authed = gateway.check_access_token(token) if token else gateway.allow_anonymous
+    await ws.accept(subprotocol=_offered_subprotocol(ws))
+
     client = Client(ws)
+    client.authed = authed
     client.pump = asyncio.create_task(client.run())
     gateway.attach(client)
+
+    watchdog: asyncio.Task | None = None
+    if not client.authed:
+        async def auth_watchdog() -> None:
+            """认证宽限期看门狗。没有它，未认证连接可以无限占位。"""
+            await asyncio.sleep(AUTH_GRACE_SECONDS)
+            if client.authed:
+                return
+            gateway._send_error(client, ERROR_CODES.UNAUTHORIZED, "认证超时，连接即将关闭")
+            await asyncio.sleep(0.05)
+            try:
+                await ws.close(code=4401, reason="auth timeout")
+            except Exception:
+                pass
+        watchdog = asyncio.create_task(auth_watchdog())
+
     try:
         while True:
-            raw = await ws.receive_text()
-            await gateway.handle(client, raw)
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+            try:
+                raw = await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            try:
+                await gateway.handle(client, raw)
+            except Exception as err:
+                # 关键改动：单条报文处理失败**不再带走整个连接**。
+                # 旧版这里是一句 `except Exception: pass`，结果是
+                # 一个畸形参数（比如 brightness:"abc"）会让客户端
+                # 直接掉线，而且拿不到任何原因 —— 排查成本极高。
+                print(f"[ws] 处理报文失败：{err!r}")
+                traceback.print_exc()
+                gateway._send_error(client, ERROR_CODES.INTERNAL,
+                                    f"处理报文时出错：{type(err).__name__}")
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         gateway.detach(client)
 
 
@@ -237,7 +473,7 @@ app.mount("/", StaticFiles(directory=str(PUBLIC), html=True), name="public")
 
 
 def main() -> None:
-    import uvicorn
+    _startup_banner()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

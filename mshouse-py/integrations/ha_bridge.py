@@ -43,6 +43,7 @@ import os
 import signal
 import ssl
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -89,7 +90,7 @@ GW_DEVICE = {
     "identifiers": ["mshouse_gateway"],
     "name": "MSHouse 网关",
     "manufacturer": "Mirror Space",
-    "model": "MSHouse Gateway v1.0",
+    "model": "MSHouse Gateway v2.0",
 }
 
 
@@ -173,10 +174,19 @@ def _render_ac(s: dict[str, Any]) -> dict[str, Any]:
 
 
 def _render_sensor(s: dict[str, Any]) -> dict[str, Any]:
+    """
+    传感器状态渲染。
+
+    v2.0 起不再输出 comfort：那是应用层派生量，真实温湿度传感器
+    （Zigbee 0x0402 / Matter TemperatureMeasurement）只上报物理量。
+    把它当设备原生属性发布到 HA，会让人误以为「这传感器能测舒适度」。
+    需要舒适度请用 HA 自己的 template sensor，或读网关的 derived 字段。
+    """
     return {
         "temperature": round(float(s.get("temperature") or 0), 1),
         "humidity": round(float(s.get("humidity") or 0), 1),
-        "comfort": s.get("comfort") or "未知",
+        "battery": int(round(float(s.get("battery") or 0))),
+        "rssi": int(round(float(s.get("rssi") or 0))),
     }
 
 
@@ -222,7 +232,6 @@ def build_entities(prefix: str, avail: str) -> list[Entity]:
     """按物模型生成全部 HA 实体。"""
     ents: list[Entity] = []
     common = {
-        "availability_topic": avail,
         "payload_available": "online",
         "payload_not_available": "offline",
     }
@@ -231,7 +240,19 @@ def build_entities(prefix: str, avail: str) -> list[Entity]:
         dev = _device_block(spec)
         oid = _oid(spec.id)
         st = f"{prefix}/{spec.id}/state"
-        base = {**common, "device": dev}
+        # 设备级可用性。
+        # 旧版只发了网关级 availability，于是某台设备掉线时，HA 里那台设备
+        # 仍然显示「可用 + 最后已知状态」—— 这比不显示更危险：
+        # 使用者会以为那是实时值。现在两个 topic 都要求 online。
+        base = {
+            **common,
+            "device": dev,
+            "availability": [
+                {"topic": avail},
+                {"topic": f"{prefix}/{spec.id}/availability"},
+            ],
+            "availability_mode": "all",
+        }
 
         # ---------------- 灯 ----------------
         if spec.type == "light":
@@ -268,8 +289,14 @@ def build_entities(prefix: str, avail: str) -> list[Entity]:
                 ("humidity", "湿度", "{{ value_json.humidity }}",
                  {"unit_of_measurement": "%", "device_class": "humidity",
                   "state_class": "measurement", "icon": "mdi:water-percent"}),
-                ("comfort", "舒适度", "{{ value_json.comfort }}",
-                 {"icon": "mdi:emoticon-happy-outline"}),
+                # 「舒适度」实体已移除（见 _render_sensor 的说明）。
+                # 补上真实传感器一定会上报的两项器件状态：
+                ("battery", "电量", "{{ value_json.battery }}",
+                 {"unit_of_measurement": "%", "device_class": "battery",
+                  "state_class": "measurement", "icon": "mdi:battery"}),
+                ("rssi", "信号强度", "{{ value_json.rssi }}",
+                 {"unit_of_measurement": "dBm", "device_class": "signal_strength",
+                  "state_class": "measurement", "icon": "mdi:wifi"}),
             ):
                 ents.append(Entity(
                     component="sensor",
@@ -460,7 +487,10 @@ def build_entities(prefix: str, avail: str) -> list[Entity]:
 
     # ---------------- 网关级实体 ----------------
     gw_state = f"{prefix}/gateway/state"
-    gw_common = {**common, "device": GW_DEVICE}
+    gw_common = {
+        **common, "device": GW_DEVICE,
+        "availability_topic": avail,
+    }
     for suffix, name, tmpl, extra in (
         ("scene", "当前场景", "{{ value_json.scene_name }}", {"icon": "mdi:home-automation"}),
         ("occupancy", "在家状态", "{{ value_json.occupancy_name }}", {"icon": "mdi:account-group"}),
@@ -573,8 +603,12 @@ class HaBridge:
         mqtt_tls: bool = False,
         prefix: str = "mshouse",
         discovery_prefix: str = "homeassistant",
+        token: str | None = None,
+        publish_min_interval: float = 1.0,
     ) -> None:
         self.ws_url = ws_url
+        # v2.0 起网关要求令牌；桥接器作为「客户端」同样要出示凭据
+        self.token = token or os.environ.get("MSHOUSE_TOKEN") or ""
         self.prefix = prefix
         self.discovery_prefix = discovery_prefix
         self.avail_topic = f"{prefix}/bridge/status"
@@ -587,10 +621,23 @@ class HaBridge:
         self.routes: dict[str, Callable[[str], dict[str, Any] | None]] = {}
         self._discovery_published = False
 
+        # 变化抑制：topic → 上次发布内容的指纹。
+        # 内容没变就不发 —— 旧版收到一条 state 就发一条 MQTT，
+        # 等于把网关侧的上报洪泛原样搬到了 broker。
+        self._last_payload: dict[str, str] = {}
+        # 发布节流：topic → 上次发布时间，避免瞬时突发打爆 broker
+        self._last_publish_at: dict[str, float] = {}
+        self.publish_min_interval = max(0.0, float(publish_min_interval))
+        self._dirty: set[str] = set()
+
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws: Any = None
         self._seq = 0
         self._stop = asyncio.Event()
+        self._flush_handle: asyncio.TimerHandle | None = None
+        # 出站序号追踪（发现漏收报文时请求全量对齐）
+        self._last_seq = 0
+        self._resync_needed = False
 
         self._mqtt = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2, client_id="mshouse-ha-bridge"
@@ -670,7 +717,8 @@ class HaBridge:
 
     def _envelope(self, type_: str, payload: Any) -> dict[str, Any]:
         self._seq += 1
-        return {"v": "1.0", "type": type_, "id": f"ha-{self._seq}", "payload": payload}
+        # v 必须与网关主版本一致，否则会被以 PROTOCOL_MISMATCH 拒绝（close 4426）
+        return {"v": "2.0", "type": type_, "id": f"ha-{self._seq}", "payload": payload}
 
     async def _ws_send(self, msg: dict[str, Any]) -> None:
         ws = self._ws
@@ -693,24 +741,67 @@ class HaBridge:
             if kind == "snapshot":
                 self._on_snapshot(payload)
             elif kind == "state":
+                self._note_seq(payload)
                 self._on_state(payload)
             elif kind == "ack":
-                # ack 里带回设备最新状态，直接复用同一条通路
+                # 命令受理回执（status=ACCEPTED）只带 desired/delta —— 设备还没动，
+                # 真正的状态变更随后由 state（stateKind=confirmed）推来。
+                # 只有「立即动作」和错误回执里才可能直接带 state。
                 if payload.get("deviceId") and isinstance(payload.get("state"), dict):
                     self._on_state({
                         "deviceId": payload["deviceId"],
-                        "type": payload.get("type"),
                         "state": payload["state"],
-                        "online": True,
+                        "stateKind": "full",
                     })
+                elif payload.get("ok") is False:
+                    info = payload.get("errorInfo") or {}
+                    LOG.info("命令被网关拒绝 [%s]：%s",
+                             info.get("code") or "ERROR",
+                             info.get("message") or payload.get("error") or "")
             elif kind == "event":
                 self._publish(self.event_topic, payload, retain=False)
+            elif kind == "fault":
+                # 故障是独立报文类型：把它转成事件发到 HA，
+                # 这样 HA 的自动化能像处理其它事件一样处理设备故障。
+                self._publish(self.event_topic, {
+                    "level": payload.get("severity") or "warn",
+                    "source": payload.get("deviceId"),
+                    "message": f"故障：{payload.get('message') or payload.get('faultCode')}",
+                    "faultCode": payload.get("faultCode"),
+                }, retain=False)
+            elif kind == "ota":
+                self._publish(self.event_topic, {
+                    "level": "info",
+                    "source": payload.get("deviceId"),
+                    "message": f"固件升级 {payload.get('state')}",
+                }, retain=False)
+            elif kind == "ping":
+                # 服务端心跳必须回应：连续 3 次不回会被判定失联并断开
+                await ws.send(json.dumps(
+                    self._envelope("pong", {"at": int(time.time() * 1000)})))
             elif kind == "video":
                 # 流信令（是否在推、订阅数）——并进对应设备的状态里
                 dev_id = payload.get("deviceId")
                 if dev_id and dev_id in self.devices:
                     self.devices[dev_id].setdefault("state", {})
                     self._publish_device(dev_id)
+
+            # 序号跳号 → 请求全量对齐。
+            # 网关在背压时会合并/丢弃报文，桥接器必须能发现自己漏收了什么，
+            # 否则 HA 里的实体就会永远停在一个过期的值上。
+            if self._resync_needed:
+                self._resync_needed = False
+                LOG.info("出站报文有丢失，请求重新同步")
+                await ws.send(json.dumps(
+                    self._envelope("resync", {"since": self._last_seq})))
+
+    def _note_seq(self, payload: dict[str, Any]) -> None:
+        seq = payload.get("seq")
+        if not isinstance(seq, int):
+            return
+        if self._last_seq and seq > self._last_seq + 1:
+            self._resync_needed = True
+        self._last_seq = max(self._last_seq, seq)
 
     def _on_snapshot(self, payload: dict[str, Any]) -> None:
         for dev in payload.get("devices") or []:
@@ -745,7 +836,14 @@ class HaBridge:
             dev = {"id": dev_id, "type": payload.get("type"), "state": {}}
             self.devices[dev_id] = dev
         if isinstance(payload.get("state"), dict):
-            dev.setdefault("state", {}).update(payload["state"])
+            # v2.0 起网关默认只推「变化的字段」（stateKind=delta/confirmed），
+            # 只有 full 是完整快照。这里必须区别对待：
+            # 把增量当全量用，会把这次没变的字段全部抹掉。
+            kind = payload.get("stateKind") or "full"
+            if kind == "full":
+                dev["state"] = dict(payload["state"])
+            else:
+                dev.setdefault("state", {}).update(payload["state"])
         if "online" in payload:
             dev["online"] = payload["online"]
         self._publish_device(dev_id)
@@ -772,11 +870,52 @@ class HaBridge:
         if dev is None:
             return
         state = dev.get("state") or {}
+
+        # 设备级可用性：网关在线 ≠ 每台设备都在线。
+        # 只在**可用性真的变了**的时候发 —— 否则每次状态变化都会顺带重发一条
+        # availability，等于把 MQTT 消息量凭空翻倍。retain=True 已经保证
+        # 新订阅者能拿到最新值，不需要靠重复推送来「维持」。
+        avail_topic = f"{self.prefix}/{dev_id}/availability"
+        avail = "online" if dev.get("online", True) else "offline"
+        if self._last_payload.get(avail_topic) != avail:
+            self._last_payload[avail_topic] = avail
+            self._publish(avail_topic, avail, retain=True)
+
         topic = f"{self.prefix}/{dev_id}/state"
         for ent in self.entities:
             if ent.state_topic == topic and ent.render is not None:
-                self._publish(topic, ent.render(state), retain=True)
+                payload = ent.render(state)
+                fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                if self._last_payload.get(topic) == fingerprint:
+                    # 与上次内容完全一致：不发。
+                    # MQTT 侧开了 retain，新订阅者照样拿得到最新值 ——
+                    # 不需要靠重复推送来「维持」状态。
+                    return
+                now = time.monotonic()
+                if now - self._last_publish_at.get(topic, 0.0) < self.publish_min_interval:
+                    # 节流窗口内：先记为脏，窗口过后补发最新值
+                    self._dirty.add(dev_id)
+                    self._schedule_flush()
+                    return
+                self._last_payload[topic] = fingerprint
+                self._last_publish_at[topic] = now
+                self._dirty.discard(dev_id)
+                self._publish(topic, payload, retain=True)
                 return
+
+    def _schedule_flush(self) -> None:
+        """节流窗口结束后补发脏设备的最新状态。"""
+        if self._flush_handle is not None or not self._dirty or self._loop is None:
+            return
+        self._flush_handle = self._loop.call_later(
+            self.publish_min_interval, self._flush_dirty)
+
+    def _flush_dirty(self) -> None:
+        self._flush_handle = None
+        pending = list(self._dirty)
+        self._dirty.clear()
+        for dev_id in pending:
+            self._publish_device(dev_id)
 
     def _publish_gateway(self) -> None:
         meta = self.gateway_meta
@@ -804,10 +943,18 @@ class HaBridge:
         backoff = 3
         while not self._stop.is_set():
             try:
+                # 子协议是浏览器之外唯一稳定的凭据传递方式；
+                # websockets 库在客户端侧同样支持
+                protocols = ["mshouse.v1"]
+                if self.token:
+                    protocols.append(f"bearer.{self.token}")
                 async with websockets.connect(
-                    self.ws_url, max_size=None, ping_interval=20, ping_timeout=20
+                    self.ws_url, max_size=None, ping_interval=20, ping_timeout=20,
+                    subprotocols=protocols,
                 ) as ws:
                     self._ws = ws
+                    self._last_seq = 0
+                    self._resync_needed = False
                     LOG.info("已连接 MSHouse 网关：%s", self.ws_url)
                     self._set_online(True)
                     backoff = 3
@@ -867,6 +1014,8 @@ def main() -> int:
     )
     ap.add_argument("--ws", default=os.environ.get("MSHOUSE_WS", "ws://127.0.0.1:8080/ws"),
                     help="MSHouse 网关 WebSocket 地址")
+    ap.add_argument("--token", default=os.environ.get("MSHOUSE_TOKEN"),
+                    help="访问令牌（v2.0 起网关要求；也可用环境变量 MSHOUSE_TOKEN）")
     ap.add_argument("--mqtt-host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
     ap.add_argument("--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT", "1883")))
     ap.add_argument("--mqtt-username", default=os.environ.get("MQTT_USERNAME"))
@@ -900,6 +1049,7 @@ def main() -> int:
         mqtt_tls=args.mqtt_tls,
         prefix=args.prefix,
         discovery_prefix=args.discovery_prefix,
+        token=args.token,
     )
 
     loop = asyncio.new_event_loop()

@@ -60,10 +60,11 @@ HA 侧需要装 **Mosquitto broker** 加载项，或让 HA 指向你已有的 br
 # 终端 A：网关
 cd mshouse-py
 pip install -r requirements.txt
-python -m server.main
+python -m server.main          # 记下启动日志里的访问令牌
 
 # 终端 B：桥接器
 pip install paho-mqtt websockets
+export MSHOUSE_TOKEN=<启动日志里的令牌>
 python integrations/ha_bridge.py --mqtt-host 127.0.0.1
 ```
 
@@ -72,19 +73,20 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--ws` | `ws://127.0.0.1:8080/ws` | MSHouse 网关地址 |
+| `--token` | 环境变量 `MSHOUSE_TOKEN` | **访问令牌（v2.0 起必需）**，通过子协议 `bearer.<token>` 携带 |
 | `--mqtt-host` / `--mqtt-port` | `127.0.0.1` / `1883` | Broker 地址 |
 | `--mqtt-username` / `--mqtt-password` | 空 | 需要认证时填 |
 | `--mqtt-tls` | 关 | 启用 TLS（自签证书不校验） |
 | `--prefix` | `mshouse` | MQTT 主题前缀 |
 | `--print-camera-yaml` | — | 打印摄像头 YAML 片段后退出 |
 
-也支持同名环境变量：`MSHOUSE_WS`、`MQTT_HOST`、`MQTT_PORT`、`MQTT_USERNAME`、`MQTT_PASSWORD`。
+也支持同名环境变量：`MSHOUSE_WS`、`MSHOUSE_TOKEN`、`MQTT_HOST`、`MQTT_PORT`、`MQTT_USERNAME`、`MQTT_PASSWORD`。
 
 ### 3. 在 HA 里添加 MQTT 集成
 
 **设置 → 设备与服务 → 添加集成 → MQTT**，填 broker 地址即可。
 
-连接成功后，HA 会自动收到桥接器发布的 Discovery 配置，**34 个实体自动出现**，
+连接成功后，HA 会自动收到桥接器发布的 Discovery 配置，**37 个实体自动出现**，
 不需要写任何 YAML。用 `mosquitto_sub` 可以确认：
 
 ```bash
@@ -95,8 +97,13 @@ mosquitto_sub -h 127.0.0.1 -t 'homeassistant/#' -v | head
 
 ## 四、实体映射表
 
-MSHouse 的 12 台设备会展开成 34 个 HA 实体，并且**按房间自动归入对应区域**
+MSHouse 的 12 台设备会展开成 37 个 HA 实体，并且**按房间自动归入对应区域**
 （靠 Discovery 里的 `suggested_area` 字段，HA 会自动创建区域）。
+
+> **设备级可用性（v2.0 新增）**：每个实体的 `availability` 是一个**列表** ——
+> 既看桥接器本身（`mshouse/bridge/status`），也看**该设备**是否在线
+> （`mshouse/<设备>/availability`），`availability_mode: all`。
+> 这样某台设备掉线时，只有它的实体变灰，不会整片误报「不可用」。
 
 ### 灯（4 个 `light` 实体）
 
@@ -107,18 +114,25 @@ MSHouse 的 12 台设备会展开成 34 个 HA 实体，并且**按房间自动�
 | `light.bedroom` 卧室灯 | `light.mshouse_light_bedroom` | 同上 |
 | `light.bath` 卫生间灯 | `light.mshouse_light_bath` | 同上 |
 
-### 温湿度（12 个 `sensor` 实体）
+### 温湿度（16 个 `sensor` 实体）
 
-每台传感器展开成 3 个实体（温度 / 湿度 / 舒适度），共 4 组：
+每台传感器展开成 4 个实体（温度 / 湿度 / 电量 / 信号强度），共 4 组：
 
 | MSHouse 设备 | 实体 |
 |---|---|
-| `sensor.living` 客厅温湿度 | `..._living_temperature`、`..._humidity`、`..._comfort` |
+| `sensor.living` 客厅温湿度 | `..._living_temperature`、`..._humidity`、`..._battery`、`..._rssi` |
 | `sensor.kitchen` 厨房温湿度 | `..._kitchen_*` |
 | `sensor.bedroom` 卧室温湿度 | `..._bedroom_*` |
 | `sensor.bath` 卫生间温湿度 | `..._bath_*` |
 
 温湿度带 `device_class` 和 `state_class`，可以直接进 HA 的历史统计与长短期图表。
+电量与信号强度标为**诊断类**（`entity_category: diagnostic`）。
+
+> **为什么没有「舒适度」实体**：v1.0 输出过一个 `..._comfort` 文本实体，v2.0 已移除。
+> 真实温湿度传感器（Zigbee `0x0402`、Matter `TemperatureMeasurement`）只上报物理量，
+> 不会在自己的属性里塞一个语义标签；而且旧的判据（`23~27 °C 且 40~60 %RH`）没有标准出处，
+> 把 30 °C/75 % 和 18 °C/75 % 压成同一个结论。要在 HA 里要这个语义，
+> 用 **template sensor** 基于 `..._temperature` / `..._humidity` 自己算 —— 这才符合分层。
 
 ### 空调（2 个 `climate` 实体）
 
@@ -142,16 +156,15 @@ MSHouse 的 12 台设备会展开成 34 个 HA 实体，并且**按房间自动�
 画面本身**不走 MQTT**（HA 的 MQTT 集成不支持 `camera` 实体），用 YAML 直连，
 见下一节。
 
-### 门锁（1 个 `lock` + 2 个 `sensor` + 1 个 `button`）
+### 门锁（1 个 `lock` + 2 个 `sensor`）
 
 | 实体 | 说明 |
 |---|---|
 | `lock.mshouse_lock_entry` | 上锁 / 开锁 |
-| `button.mshouse_lock_entry_face` | 触发一次人脸识别开锁（住户通过、陌生人拒绝） |
 | `sensor.mshouse_lock_entry_battery` | 电量（诊断类） |
 | `sensor.mshouse_lock_entry_visitor` | 最近访客（诊断类） |
 
-### 场景与网关（5 个 `button` + 5 个 `sensor`）
+### 场景与网关（4 个 `button` + 5 个 `sensor`）
 
 | 实体 | 说明 |
 |---|---|
@@ -164,6 +177,11 @@ MSHouse 的 12 台设备会展开成 34 个 HA 实体，并且**按房间自动�
 | `sensor.mshouse_gateway_outdoor_temp` | 室外温度（初始化后来自真实天气预报） |
 | `sensor.mshouse_gateway_outdoor_humidity` | 室外湿度 |
 | `sensor.mshouse_gateway_place` | 所在地名 |
+
+**故障也进 HA**：网关上报的 `fault` 报文会被桥接器转成 `mshouse/event` 上的一条事件
+（含 `faultCode` 与严重级别），HA 的自动化可以像处理其它事件一样处理设备故障 ——
+例如「卫生间灯珠损坏 → 推送到手机」。这比让 HA 轮询设备状态更可靠：
+轮询查不出「刚才闪过一次故障」。
 
 ---
 
@@ -279,6 +297,10 @@ automation:
 ---
 
 ## 七、常见问题
+
+**Q：桥接器连不上，日志里出现 `4401` / `unauthorized`？**
+网关启用了鉴权。把启动日志里的访问令牌通过 `--token` 或环境变量 `MSHOUSE_TOKEN` 传给桥接器即可。
+如果日志里是 `4426` / `protocol mismatch`，说明桥接器与网关的协议主版本不一致，两边都要升到 v2.0。
 
 **Q：实体没出现？**
 按顺序排查：① `mosquitto_sub -t 'homeassistant/#' -v` 能看到配置说明桥在正常工作；

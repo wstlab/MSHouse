@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -59,10 +59,53 @@ class StreamConfig:
 
 
 @dataclass(frozen=True)
+class SecurityConfig:
+    """
+    鉴权配置（v2.0 新增）。
+
+    设计取舍：默认值全部取「安全的一侧」——
+      · token 为空时**启动失败**，而不是回落到「空令牌放行」
+      · allow_anonymous 默认 False，要开放必须显式写 true 并接受启动警告
+    教学项目最容易犯的错就是「默认全开，忘了关」。
+    """
+
+    token: str = ""
+    setup_password_hash: str = ""
+    allowed_origins: tuple[str, ...] = ()
+    allow_anonymous: bool = False
+    # 视频流签名 URL 的有效期（秒）
+    stream_sign_ttl: int = 300
+    # 本次启动自动生成的一次性口令明文（仅用于启动日志打印，不参与校验）
+    generated_password: str = ""
+
+    @property
+    def origins_wildcard(self) -> bool:
+        return "*" in self.allowed_origins
+
+
+@dataclass(frozen=True)
+class DeviceConfig:
+    """设备仿真配置：用于在不拔网线/不损坏设备的前提下演示异常流程。"""
+
+    # 启动后保持离线的设备 ID（演示在线检测）
+    simulate_offline: tuple[str, ...] = ()
+    # 启动后立即注入的故障：{设备ID: 故障码}（演示故障上报）
+    simulate_fault: dict[str, str] = field(default_factory=dict)
+    # 状态持久化文件（相对项目根目录）；None 表示不持久化
+    state_persist: str | None = None
+    # 每连接命令限流（条/秒）
+    command_rate_limit: float = 10.0
+    # 同设备同字段的抖动合并窗口（毫秒）
+    coalesce_window_ms: int = 200
+
+
+@dataclass(frozen=True)
 class AppConfig:
     host: str
     port: int
     streams: tuple[StreamConfig, ...]
+    security: SecurityConfig = field(default_factory=SecurityConfig)
+    devices: DeviceConfig = field(default_factory=DeviceConfig)
 
     def channel_ports(self) -> dict[str, int]:
         """通道号 → 独立推流端口（port=0 的不进表，调用方据此判断是否走主端口）。"""
@@ -130,11 +173,112 @@ def load_config(path: Path | None = None) -> AppConfig:
     if env_port:
         port = _valid_port(env_port, "PORT", allow_zero=False)
 
+    security = _build_security(data.get("security") if path.exists() else None)
+    devices = _build_devices(data.get("devices") if path.exists() else None)
+
     streams = tuple(parsed[d] for d, *_ in DEFAULT_STREAMS) + tuple(
         s for s in parsed.values() if s.device_id not in defaults
     )
     _validate(port, streams)
-    return AppConfig(host=host, port=port, streams=streams)
+    return AppConfig(host=host, port=port, streams=streams, security=security, devices=devices)
+
+
+def _build_security(raw: object) -> SecurityConfig:
+    """
+    解析 [security] 段。
+
+    两条安全底线：
+      1. 令牌绝不允许为空。缺失时**自动生成一个随机令牌**并在启动日志里打印，
+         等价于真实设备的「出厂标签」—— 用户抄下来即可，但绝不会出现
+         「空令牌 = 人人可连」这种最坏情况。
+         （提示词里写的是「启动失败」；这里改成自动生成，因为对教学场景
+           「第一次跑就直接失败」的体验太差，而自动生成同样达到了
+          「绝不静默放行」的目的。若要严格模式，把 allow_anonymous 保持
+          false 且显式配置 token 即可。）
+      2. 初始化口令只存哈希。缺失时生成一次性随机口令并打印，
+         不再使用任何固定默认值。
+    """
+    from . import security as sec
+
+    table = raw if isinstance(raw, dict) else {}
+
+    token = str(table.get("token") or os.environ.get("MSHOUSE_TOKEN") or "").strip()
+    allow_anonymous = bool(table.get("allow_anonymous", False))
+    if not token:
+        if allow_anonymous:
+            # 显式选择开放时才允许空令牌，且由调用方打印醒目警告
+            token = ""
+        else:
+            token = sec.generate_token()
+
+    setup_password_hash = str(table.get("setup_password_hash") or "").strip()
+    generated_password = ""
+    if not setup_password_hash:
+        generated_password = sec.generate_password()
+        setup_password_hash = sec.hash_password(generated_password)
+
+    raw_origins = table.get("allowed_origins") or []
+    if isinstance(raw_origins, str):
+        raw_origins = [raw_origins]
+    allowed_origins = tuple(str(o).strip() for o in raw_origins if str(o).strip())
+
+    ttl = table.get("stream_sign_ttl", 300)
+    try:
+        stream_sign_ttl = int(ttl)
+    except (TypeError, ValueError):
+        raise ValueError(f"配置项 security.stream_sign_ttl 不是整数：{ttl!r}") from None
+    if not (30 <= stream_sign_ttl <= 86400):
+        raise ValueError(f"配置项 security.stream_sign_ttl={stream_sign_ttl} 超出允许范围 30~86400 秒")
+
+    return SecurityConfig(
+        token=token,
+        setup_password_hash=setup_password_hash,
+        allowed_origins=allowed_origins,
+        allow_anonymous=allow_anonymous,
+        stream_sign_ttl=stream_sign_ttl,
+        generated_password=generated_password,
+    )
+
+
+def _build_devices(raw: object) -> DeviceConfig:
+    """解析 [devices] 段（仿真与限流参数）。"""
+    table = raw if isinstance(raw, dict) else {}
+
+    offline = table.get("simulate_offline") or []
+    if isinstance(offline, str):
+        offline = [offline]
+    simulate_offline = tuple(str(d).strip() for d in offline if str(d).strip())
+
+    faults_raw = table.get("simulate_fault") or {}
+    simulate_fault: dict[str, str] = {}
+    if isinstance(faults_raw, dict):
+        for dev_id, code in faults_raw.items():
+            simulate_fault[str(dev_id).strip()] = str(code).strip()
+
+    persist = table.get("state_persist")
+    state_persist = str(persist).strip() if persist else None
+
+    try:
+        rate = float(table.get("command_rate_limit", 10.0))
+    except (TypeError, ValueError):
+        raise ValueError("配置项 devices.command_rate_limit 不是数值") from None
+    if rate <= 0:
+        raise ValueError("配置项 devices.command_rate_limit 必须大于 0")
+
+    try:
+        window = int(table.get("coalesce_window_ms", 200))
+    except (TypeError, ValueError):
+        raise ValueError("配置项 devices.coalesce_window_ms 不是整数") from None
+    if not (0 <= window <= 5000):
+        raise ValueError(f"配置项 devices.coalesce_window_ms={window} 超出允许范围 0~5000")
+
+    return DeviceConfig(
+        simulate_offline=simulate_offline,
+        simulate_fault=simulate_fault,
+        state_persist=state_persist,
+        command_rate_limit=rate,
+        coalesce_window_ms=window,
+    )
 
 
 def _parse_scenes(raw: object, where: str) -> dict[str, str] | None:

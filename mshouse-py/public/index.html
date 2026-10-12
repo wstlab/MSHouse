@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MSHouse 镜像家居 · 智能家居数字孪生教学</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2b15a'/%3E%3Cpath d='M8 16l8-6 8 6v9H8z' fill='%231b1408'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/css/app.css?v=17" />
+  <link rel="stylesheet" href="/css/app.css?v=24" />
 </head>
 <body class="panel-hidden">
   <canvas id="viewport"></canvas>
@@ -20,7 +20,7 @@
     </div>
     <div class="scenes" id="scenes"></div>
     <button class="chip" id="setupBtn" type="button">设置</button>
-    <a class="chip" id="docsBtn" href="/docs.html?v=18" target="_blank" rel="noopener">文档</a>
+    <a class="chip" id="docsBtn" href="/docs.html?v=24" target="_blank" rel="noopener">文档</a>
     <button class="chip" id="menuToggle" type="button" aria-pressed="false">控制</button>
   </header>
 
@@ -142,15 +142,15 @@
       <div id="setupAuthPane">
         <header>
           <h2>设置</h2>
-          <p>请先输入教学口令，验证通过后才能查看与修改设置。</p>
+          <p>请先输入初始化口令，验证通过后才能查看与修改设置。</p>
         </header>
         <label>口令
-          <input id="setupPassword" type="password" name="password" autocomplete="current-password" placeholder="教学口令 villa" />
+          <input id="setupPassword" type="password" name="password" autocomplete="current-password" placeholder="启动日志中打印的初始化口令" />
         </label>
         <p class="setup-error" id="setupAuthError" hidden></p>
         <footer>
           <button class="mini" type="button" id="setupCancel">取消</button>
-          <button class="primary" type="button" id="setupAuthBtn">下一步</button>
+          <button class="primary" type="submit" id="setupAuthBtn">下一步</button>
         </footer>
       </div>
 
@@ -213,6 +213,26 @@
     </form>
   </dialog>
 
+  <!-- 连接设置：v2.0 起 /ws 需要访问令牌，浏览器只能通过子协议携带 -->
+  <dialog class="setup" id="connDialog">
+    <form id="connForm" method="dialog">
+      <header>
+        <h2>连接设置</h2>
+        <p>网关已启用鉴权。访问令牌在服务端启动日志里（也可写入 config.toml 的 security.token）。</p>
+      </header>
+      <label>访问令牌
+        <input id="connToken" type="password" autocomplete="off" placeholder="粘贴启动日志里的访问令牌" />
+      </label>
+      <p class="hint" style="margin-top:8px">
+        只保存在本机浏览器（localStorage），不会发往第三方。留空则清除，以匿名方式连接。
+      </p>
+      <footer>
+        <button class="mini" type="button" id="connCancel">取消</button>
+        <button class="primary" type="submit" id="connSave">保存并重连</button>
+      </footer>
+    </form>
+  </dialog>
+
   <!-- Three.js 已本地内置到 /vendor，离线也能跑；只需给裸模块名 three 做映射 -->
   <script type="importmap">
     {
@@ -221,6 +241,6 @@
       }
     }
   </script>
-  <script type="module" src="/js/main.js?v=17"></script>
+  <script type="module" src="/js/main.js?v=24"></script>
 </body>
 </html>

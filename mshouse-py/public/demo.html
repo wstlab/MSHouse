@@ -43,10 +43,11 @@
   header h1 { margin: 0; font-size: 16px; white-space: nowrap; }
   header .sub { color: var(--muted); font-size: 12px; margin-right: auto; }
   .field { display: flex; gap: 6px; align-items: center; }
-  input[type="text"] {
+  input[type="text"], input[type="password"] {
     background: #18241f; color: var(--ink); border: 1px solid var(--line);
     border-radius: 10px; padding: 8px 10px; min-width: 260px;
   }
+  input[type="password"] { min-width: 190px; font-family: var(--mono); font-size: 12px; }
   button.btn {
     border: 1px solid var(--line); background: rgba(255,255,255,.05); color: var(--ink);
     border-radius: 10px; padding: 8px 13px; transition: 140ms ease;
@@ -62,6 +63,7 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); display: inline-block; }
   .dot.ok { background: var(--ok); box-shadow: 0 0 9px var(--ok); }
   .dot.wait { background: var(--gold); }
+  .dot.bad { background: var(--danger); box-shadow: 0 0 9px var(--danger); }
 
   main { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,420px); gap: 14px; padding: 14px 18px 40px; }
   @media (max-width: 1080px) { main { grid-template-columns: 1fr; } }
@@ -178,6 +180,7 @@
   <span class="sub">只依赖 WebSocket 与 HTTP 流，不依赖主应用的任何代码</span>
   <div class="field">
     <input type="text" id="server" spellcheck="false" placeholder="http://localhost:8080" />
+    <input type="password" id="token" spellcheck="false" placeholder="访问令牌（网关启动日志里有）" />
     <button class="btn primary" id="connect">连接</button>
   </div>
   <div class="row"><span class="dot" id="dot"></span><span class="muted" id="status">未连接</span></div>
@@ -283,7 +286,11 @@
  * 第 1 部分：协议客户端（这部分可以整段拷到你的项目里）
  * ========================================================================== */
 
-const PROTOCOL_VERSION = "1.1";
+/** 协议版本。主版本与网关不一致会被拒绝（close 4426），见 docs/INTEGRATION.md 3.5 */
+const PROTOCOL_VERSION = "2.0";
+
+/** 子协议名。浏览器的 WebSocket 构造函数没法自定义请求头，令牌只能搭子协议的车 */
+const WS_SUBPROTOCOL = "mshouse.v1";
 let seq = 1;
 const nextId = (p = "c") => `${p}-${Date.now().toString(36)}-${seq++}`;
 
@@ -330,6 +337,9 @@ class TwinClient {
     this.scene = null;
     this.site = null;
     this.outdoor = null;
+    this.faults = new Map();      // deviceId -> [故障对象]，v2.0 新增
+    this.seq = 0;                 // 已收到的最大出站序号，用于发现丢包
+    this.dropped = 0;             // 本地统计的跳号次数
     this._manual = true;          // 默认不连接：必须显式调用 connect()
     this._retry = 0;
     this._retryTimer = null;
@@ -337,32 +347,44 @@ class TwinClient {
 
   get connected() { return this.ws?.readyState === 1; }
 
-  connect(url) {
+  connect(url, token = "") {
     this.close(true);
     this._manual = false;
     this.url = url;
-    const ws = new WebSocket(url);
+    this.token = token;
+    // 令牌通过子协议传递：["mshouse.v1", "bearer.<token>"]
+    // 网关从 Sec-WebSocket-Protocol 里把它取出来校验。
+    const protocols = token ? [WS_SUBPROTOCOL, `bearer.${token}`] : [WS_SUBPROTOCOL];
+    const ws = new WebSocket(url, protocols);
     this.ws = ws;
 
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this._retry = 0;
+      this.seq = 0;               // 新连接，序号从头算
       this.onOpen();
     };
     ws.onerror = () => { /* 交给 onclose 统一处理重连 */ };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (this.ws !== ws) return;          // 已被新连接取代，忽略旧 socket
       this.ws = null;
-      this.onClose();
+      this.onClose(ev);
       if (this._manual) return;            // 主动断开：不重连
+      // 鉴权与版本问题重连也没用，直接停下并把原因说清楚
+      if (ev && (ev.code === 4401 || ev.code === 4426)) return;
       // 断线重连：真实项目里应该用指数退避 + 抖动
       this._retry += 1;
       const delay = Math.min(8000, 600 * this._retry);
-      this._retryTimer = setTimeout(() => { if (!this._manual) this.connect(this.url); }, delay);
+      this._retryTimer = setTimeout(() => { if (!this._manual) this.connect(this.url, this.token); }, delay);
     };
     ws.onmessage = (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
+      // 服务端心跳必须回，否则 3 次未响应会被以 4408 断开（见 3.3）
+      if (msg.type === "ping") {
+        this._raw({ v: PROTOCOL_VERSION, type: "pong", ts: Date.now(), payload: {} });
+        return;
+      }
       this._absorb(msg);
       this.onMessage(msg);
     };
@@ -394,17 +416,34 @@ class TwinClient {
   /** 把下行消息同步进本地影子，这样界面永远读的是「最后已知状态」 */
   _absorb(msg) {
     const p = msg.payload;
+    // 出站序号：跳号说明中间丢过报文，记一笔（真实项目里会据此触发 resync）
+    if (typeof p?.seq === "number") {
+      if (this.seq && p.seq > this.seq + 1) this.dropped += 1;
+      this.seq = Math.max(this.seq, p.seq);
+    }
     switch (msg.type) {
       case "snapshot":
         this.devices.clear();
-        for (const d of p.devices || []) this.devices.set(d.id, d);
+        this.faults.clear();
+        for (const d of p.devices || []) {
+          this.devices.set(d.id, d);
+          if (d.faults?.length) this.faults.set(d.id, [...d.faults]);
+        }
         this.scene = p.scene;
         this.site = p.site;
         this.outdoor = p.outdoor;
+        if (typeof p.currentSeq === "number") this.seq = p.currentSeq;
         break;
       case "state": {
         const d = this.devices.get(p.deviceId);
-        if (d) d.state = p.state;      // 增量：只覆盖 state，其它元数据不动
+        if (!d) break;
+        // delta / confirmed 是增量，必须与本地状态合并；
+        // 只有 full 才能直接替换 —— 否则会把本次没变的字段抹掉（见 4.2）。
+        if (p.stateKind === "full") d.state = { ...p.state };
+        else d.state = { ...(d.state || {}), ...p.state };
+        d.derived = p.derived ?? d.derived;
+        d.online = p.online;
+        d.updatedAt = p.updatedAt;
         break;
       }
       case "scene":
@@ -414,6 +453,19 @@ class TwinClient {
         this.site = p.site;
         this.outdoor = p.outdoor;
         break;
+      case "fault": {
+        const list = this.faults.get(p.deviceId) || [];
+        if (!list.some((f) => f.code === p.faultCode)) {
+          list.push({ code: p.faultCode, severity: p.severity, message: p.message, since: p.since });
+        }
+        this.faults.set(p.deviceId, list);
+        break;
+      }
+      case "ota": {
+        const d = this.devices.get(p.deviceId);
+        if (d) d.ota = { state: p.state, progress: p.progress, version: p.version };
+        break;
+      }
       default:
         break;
     }
@@ -428,7 +480,9 @@ class TwinClient {
 
   setScene(sceneId) { return this.send("scene", { sceneId }); }
   ping() { return this.send("ping", { at: Date.now() }); }
-  resync() { return this.send("snapshot", {}); }
+
+  /** 拉一次全量。发现 seq 跳号时也走这里 —— 增量丢了就用全量对齐（见 3.4） */
+  resync() { return this.send("resync", { since: this.seq }); }
 
   /** 原样发送一条报文（执行框用），不重新封装 */
   sendRaw(msg) { return this._raw(msg); }
@@ -451,6 +505,8 @@ const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bat
 const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
 const FAN_LABEL = { low: "低风", mid: "中风", high: "高风", auto: "自动" };
 const SCENE_LABEL = { home: "回家", away: "离家", sleep: "睡眠", movie: "观影" };
+/** 派生舒适度的中文映射放前端：服务端只发机器可读枚举，换语言不用动协议 */
+const COMFORT_LABEL = { cool: "偏凉", comfortable: "舒适", warm: "偏热", hot: "闷热" };
 
 /**
  * 设备角色划分 —— 这个 demo 的教学主线。
@@ -561,10 +617,13 @@ function registerCard(id, fn) {
 const streamState = new Map();
 let streamCards = new Map();          // deviceId -> paint()
 
-/** 通道播放地址：/?stream=<通道名>，与 WebSocket 地址同一个主机 */
+/** 通道播放地址：/?stream=<通道名>，与 WebSocket 地址同一个主机。
+ *  v2.0 起像素通道也要鉴权，而 <img> 带不了请求头 —— 把令牌拼在查询串上。 */
 function streamUrl(channel) {
   const base = client.url ? toHttpBase(client.url) : null;
-  return base && channel ? `${base}/?stream=${channel}` : "";
+  if (!base || !channel) return "";
+  const token = client.token || "";
+  return `${base}/?stream=${channel}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
 }
 
 function upsertStream(deviceId, patch) {
@@ -694,7 +753,15 @@ function buildSenseCard(d) {
   const sync = (s) => {
     if (d.type === "sensor") {
       val.textContent = `${(s.temperature ?? 0).toFixed(1)}°C / ${Math.round(s.humidity ?? 0)}%RH`;
-      note.textContent = `${s.comfort || ""} · 遥测上报`;
+      // comfort 不再是设备属性，而是网关算出来的派生量（见 4.3）
+      const dv = d.derived || {};
+      const label = COMFORT_LABEL[dv.comfort] || "";
+      const parts = [];
+      if (label) parts.push(label);
+      if (dv.thi != null) parts.push(`THI ${dv.thi.toFixed(1)}`);
+      if (s.battery != null) parts.push(`电量 ${Math.round(s.battery)}%`);
+      if (s.rssi != null) parts.push(`${Math.round(s.rssi)}dBm`);
+      note.textContent = `${parts.join(" · ")} · 遥测上报`;
     } else if (d.type === "camera") {
       val.textContent = `${s.streaming ? "推流中" : "待机"} · 云台 ${Math.round(s.pan ?? 0)}°`;
       note.textContent = `${s.armed ? "布防" : "撤防"}${s.motion ? " · 检测到移动" : ""} · 流通道 ${d.channel || "--"}`;
@@ -851,8 +918,16 @@ const client = new TwinClient({
     $("#connect").textContent = "断开";
     toast("已接入网关");
   },
-  onClose: () => {
+  onClose: (ev) => {
     $("#connect").textContent = "连接";
+    // 连接级错误：网关用 close code 说明原因，重连也是白搭（见 3.1 / 3.5）
+    const reason = { 4401: "未认证：令牌缺失或错误", 4408: "心跳超时", 4426: "协议版本不匹配" }[ev?.code];
+    if (reason) {
+      $("#dot").className = "dot bad";
+      $("#status").textContent = reason;
+      toast(reason, true);
+      return;
+    }
     if (client._manual) {
       $("#dot").className = "dot";
       $("#status").textContent = "已断开";
@@ -866,7 +941,8 @@ const client = new TwinClient({
     addWire("in", msg, !wirePass(msg));
     switch (msg.type) {
       case "hello":
-        toast(`握手成功 · ${msg.payload?.protocol || ""}`);
+        toast(`握手成功 · ${msg.payload?.protocol || ""}`
+          + (msg.payload?.authed === false ? "（未认证）" : ""));
         break;
       case "snapshot": {
         const p = msg.payload;
@@ -911,7 +987,18 @@ const client = new TwinClient({
         if (msg.payload.level === "alarm") toast("⚠ " + msg.payload.message);
         break;
       case "ack":
-        if (msg.payload?.ok === false) toast(`命令被拒绝：${msg.payload.error}`, true);
+        // 过渡期双写：errorInfo 是结构化对象（按 code 分支），error 是纯字符串
+        if (msg.payload?.ok === false) {
+          const code = msg.payload.errorInfo?.code || "ERROR";
+          toast(`命令被拒绝 [${code}]：${msg.payload.errorInfo?.message || msg.payload.error}`, true);
+        }
+        break;
+      case "fault":
+        toast(`⚠ ${msg.payload.message}（${msg.payload.deviceId}）`, true);
+        break;
+      case "ota":
+        if (msg.payload.state === "success") toast(`${msg.payload.deviceId} 固件已升级到 ${msg.payload.version}`);
+        else if (msg.payload.state === "failed") toast(`${msg.payload.deviceId} 固件升级失败`, true);
         break;
       case "setup":
         toast("位置与室外温度已更新");
@@ -944,17 +1031,27 @@ function defaultServer() {
   return location.protocol.startsWith("http") ? location.origin : "http://localhost:8080";
 }
 
+function defaultToken() {
+  const q = new URLSearchParams(location.search).get("token");
+  if (q) return q;
+  return localStorage.getItem("mshouse.demo.token") || "";
+}
+
 function doConnect() {
   const raw = $("#server").value.trim();
   const url = toWsUrl(raw);
   if (!url) { toast("服务器地址不合法", true); return; }
+  const token = $("#token").value.trim();
   localStorage.setItem("mshouse.demo.server", raw);
+  if (token) localStorage.setItem("mshouse.demo.token", token);
+  else localStorage.removeItem("mshouse.demo.token");
   $("#status").textContent = "连接中…";
   $("#dot").className = "dot wait";
-  client.connect(url);
+  client.connect(url, token);
 }
 
 $("#server").value = defaultServer();
+$("#token").value = defaultToken();
 $("#connect").addEventListener("click", () => {
   if (client.connected) client.disconnect();   // 主动断开，不自动重连
   else doConnect();

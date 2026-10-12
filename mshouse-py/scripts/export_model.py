@@ -48,8 +48,32 @@ def build() -> str:
     msg_fields = "\n".join(
         f'  {name}: "{getattr(M.MSG, name)}",'
         for name in ("HELLO", "SNAPSHOT", "COMMAND", "ACK", "STATE", "EVENT",
-                     "SCENE", "VIDEO", "ERROR", "PING", "PONG", "SETUP")
+                     "SCENE", "VIDEO", "ERROR", "PING", "PONG", "SETUP",
+                     "SETUP_AUTH", "FACE_ENROLL", "RESYNC", "FAULT", "OTA")
     )
+    state_kinds = "\n".join(
+        f'  {name}: "{getattr(M.STATE_KIND, name)}",'
+        for name in ("DELTA", "FULL", "CONFIRMED")
+    )
+    error_codes = "\n".join(
+        f'  {name}: "{getattr(M.ERROR_CODES, name)}",'
+        for name in (
+            "BAD_JSON", "BAD_ENVELOPE", "UNKNOWN_TYPE", "UNAUTHORIZED", "FORBIDDEN",
+            "PROTOCOL_MISMATCH", "DEVICE_NOT_FOUND", "ACTION_NOT_SUPPORTED",
+            "UNSUPPORTED_CAPABILITY", "INVALID_PARAM", "READ_ONLY_DEVICE",
+            "DEVICE_OFFLINE", "DEVICE_TIMEOUT", "RATE_LIMITED", "SETUP_DENIED", "INTERNAL",
+        )
+    )
+    comfort_levels = "\n".join(
+        f'  {name}: "{getattr(M.COMFORT, name)}",'
+        for name in ("COOL", "COMFORTABLE", "WARM", "HOT")
+    )
+    # 上报参数也一并导出：前端调试面板可以据此解释「为什么这条数据没更新」
+    # 注意：json.dumps 出来的是完整对象（自带最外层花括号），
+    # 模板里会补上 `export const REPORTING = { ... };` 那一层，
+    # 所以这里必须先剥掉最外层，否则会生成 `= { { ... } }` 这种语法错误。
+    raw = json.dumps(M.REPORTING, ensure_ascii=False, indent=2).splitlines()
+    reporting = "\n".join(raw[1:-1])
 
     return f"""/**
  * MSHouse 镜像家居 · 物模型与协议常量
@@ -65,11 +89,28 @@ def build() -> str:
 
 export const PROTOCOL_VERSION = {js_value(M.PROTOCOL_VERSION)};
 
-/** 初始化设置口令。教学演示用，真实项目应换成服务端哈希校验。 */
-export const SETUP_PASSWORD = {js_value(M.SETUP_PASSWORD)};
-
 export const MSG = {{
 {msg_fields}
+}};
+
+/** state 报文的语义：delta 增量 / full 全量 / confirmed 执行确认 */
+export const STATE_KIND = {{
+{state_kinds}
+}};
+
+/** 结构化错误码。客户端按 code 分支，不要去匹配中文文案。 */
+export const ERROR_CODES = {{
+{error_codes}
+}};
+
+/** THI 温湿指数分级（机器可读；中文映射在 ui.js 里） */
+export const COMFORT = {{
+{comfort_levels}
+}};
+
+/** 上报参数（对应 Zigbee 的 ReportableChange / Min / MaxReportingInterval） */
+export const REPORTING = {{
+{reporting}
 }};
 
 export const ROOMS = [
