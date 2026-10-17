@@ -225,7 +225,7 @@
     <h2 id="overview">1. 概述</h2>
     <p>
       MSHouse 是一套<strong>纯软件运行的虚拟智能家居</strong>，用数字孪生的方式还原一栋两层别墅：
-      客厅、厨房、主卧、卫生间、门厅五个房间，灯、空调、温湿度传感器、云台摄像头、人脸门锁五类设备。
+      客厅、厨房、主卧、卫生间、门厅五个房间，灯、空调、温湿度传感器、云台摄像头、人脸门锁、电动窗帘六类设备。
       所有设备都有真实的状态、响应与联动逻辑，不依赖任何实体硬件，适合课堂教学、协议演示与二次开发。
     </p>
     <p>
@@ -254,6 +254,7 @@
       <tr><td><code>sensor.bath</code></td><td>温湿度</td><td>卫生间</td><td>同上</td></tr>
       <tr><td><code>camera.living</code></td><td>摄像头</td><td>客厅</td><td>开关、云台 0–359°、布防、移动侦测、推流</td></tr>
       <tr><td><code>lock.entry</code></td><td>人脸锁</td><td>门厅</td><td>上锁 / 开锁、人脸画面识别、视频推流</td></tr>
+      <tr><td><code>curtain.bedroom</code></td><td>电动窗帘</td><td>主卧</td><td>开 / 关、开度 0–100%（设值/开/关/翻转）</td></tr>
     </table>
 
     <h2 id="workflow">3. 工作流程</h2>
@@ -266,12 +267,31 @@
 
     <h3>3.2 首次使用</h3>
     <p>
-      点击顶部「设置」按钮，输入<b>初始化口令</b>后可写入住宅位置（经纬度、地点名）。
-      写入后网关会按当地天气预报初始化室外温湿度，并影响室内传感器与空调的初始值。
-      你也可以在设置里把大门锁画面来源切换为：静态画面（默认，按天气切换）、本机摄像头、网络视频流（RTSP / HTTP-MJPEG）。
+      点击顶部「设置」按钮，输入<b>初始化口令</b>后，设置页按用途分成三张卡片：
+      <b>地点</b>（地点名称 / 详细地址 / 经纬度）、<b>摄像头</b>（大门锁画面来源）、
+      <b>人脸锁</b>（人脸登记库的登记与删除）。
+    </p>
+    <p>
+      在「地点」里写入经纬度后，网关会按当地天气预报初始化室外温湿度，并影响室内传感器与空调的初始值。
+      在「摄像头」里可把大门锁画面来源切换为：静态画面（默认，按天气切换）、本机摄像头、
+      网络视频流（RTSP / HTTP-MJPEG）、<b>浏览器摄像头</b>。
     </p>
     <div class="note">
-      <b>口令从哪来</b>：v2.0 起口令不再以明文出现在源码或网页里。
+      <b>什么是「浏览器摄像头」</b>：用<b>打开这个网页的那台设备</b>（笔记本 / 手机 / 平板）
+      的摄像头推流给网关。网关本身没有摄像头、或者摄像头在另一台机器上时用这个。
+      选中后点「开启摄像头」授权，再回「画面」标签点「推送画面」，画面就会出现在大门通道里，
+      同时被送去做人脸识别。注意它<b>只在网页开着的时候才有画面</b>，
+      而且浏览器只在 <code>https</code> 或 <code>localhost</code> 下才允许访问摄像头。
+    </div>
+    <div class="note">
+      <b>「人脸锁」卡片</b>：登记库里列出全部已登记用户，并区分「内置登记照」与「现场登记」。
+      可以在这里直接<b>上传照片登记新用户</b>；如果浏览器摄像头正开着，还能点
+      「用摄像头抓拍登记」当场拍一张。每行右侧的「删除」会把人脸图连同特征一起删掉，
+      重启也不会复活。登记 / 删除都要带设置口令 —— HTTP 端点没有 WebSocket 那样的会话可挂鉴权，
+      口令由前端从刚验证过的输入框里带过去。
+    </div>
+    <div class="note">
+      <b>口令从哪来</b>：口令不以明文出现在源码或网页里。
       首次启动网关时，控制台会打印一个随机口令（只打印一次，请立即保存）；
       也可以运行 <code>python -m server.hash_password</code> 自定义，
       把输出的哈希填进 <code>config.toml</code> 的 <code>security.setup_password_hash</code>。
@@ -286,22 +306,30 @@
     <h3>3.3 日常交互</h3>
     <ul>
       <li><strong>三维视图</strong>：拖拽旋转、滚轮缩放、点击设备查看高亮。房子前方显示当前地点名称。</li>
-      <li><strong>控制面板</strong>：右侧「控制」标签分页列出所有设备卡片，可直接开关、调光、调温、转动云台、上锁/开锁。</li>
-      <li><strong>场景按钮</strong>：顶栏「回家 / 离家 / 睡眠 / 观影」一键批量切换多设备状态。</li>
-      <li><strong>画面标签</strong>：开启摄像头或门锁的 MJPEG 推流，实时观看画面；锁画面可上传人脸照片作为登记住户。</li>
+      <li><strong>控制面板</strong>：右侧「控制」标签分页列出所有设备卡片，可直接开关、调光、调温、转动云台、上锁/开锁、调整窗帘开度。</li>
+      <li><strong>场景按钮</strong>：顶栏「回家 / 离家 / 睡眠 / 观影」一键批量切换多设备状态（睡眠/离家自动关窗帘）。</li>
+      <li><strong>画面标签</strong>：开启摄像头或门锁的 MJPEG 推流，实时观看画面。
+        若大门锁画面来源是「浏览器摄像头」，这里还会多出一栏设备选择与
+        「开启浏览器摄像头」按钮。人脸登记在「设置 → 人脸锁」里做。</li>
       <li><strong>报文标签</strong>：查看所有 WebSocket 收发报文，用于协议教学与调试。</li>
     </ul>
 
     <h3>3.4 人脸开锁与登记</h3>
     <p>
-      当锁画面来源为摄像头/视频流并开启推送时，网关会对每帧做人脸检测：
+      当锁画面来源为摄像头 / 视频流 / 浏览器摄像头并开启推送时，网关会对实时画面做人脸识别
+      （<b>YuNet</b> 检测 + <b>SFace</b> 识别，OpenCV Zoo 的 INT8 块量化模型，
+      128 维特征 + 余弦距离，<code>distance = 1 − cos ≤ 0.637</code> 判定为本人）：
     </p>
     <ul>
       <li>识别到已登记人脸 → 自动开锁，状态显示「识别通过 · 姓名」。</li>
       <li>识别到未登记人脸 → 连续确认后弹出横幅询问「是否登记用户」，可命名保存到 <code>camera/faces/</code>，重启仍有效。</li>
+      <li>已登记用户可在「设置 → 人脸锁」卡片里查看、登记与删除；登记后立刻生效，不用重启。</li>
+      <li>内置登记照是 <code>camera/face.jpg</code>；没有它也能用，走「登记用户」现场注册即可。</li>
     </ul>
     <div class="note">
       旧版「模拟住户人脸 / 模拟访客」按钮已移除；人脸识别完全由上传画面或摄像头实时帧驱动。
+      阈值可在 <code>config.toml</code> 的 <code>[streams.lock_entry.face]</code> 里调，
+      运行状态（含实际加载的模型名）见 <code>GET /health</code> 的 <code>lock.face</code>。
     </div>
 
     <h2 id="ws">4. WebSocket 接口</h2>
@@ -311,7 +339,7 @@
       建链并认证后服务端主动推 <code>hello</code>、<code>snapshot</code>、<code>event</code>。
       所有消息使用同一信封：
     </p>
-    <pre><code>{ "v": "2.0", "type": "command", "id": "ui-xxx", "ts": 1796000000000,
+    <pre><code>{ "v": "1.0.0", "type": "command", "id": "ui-xxx", "ts": 1796000000000,
   "payload": { "deviceId": "light.living", "action": "set",
                "params": { "power": true, "brightness": 80 } } }</code></pre>
     <p>
@@ -326,6 +354,7 @@
       <tr><td>light</td><td><code>on / off / toggle / set</code></td><td><code>{ power, brightness, colorTemp }</code></td></tr>
       <tr><td>ac</td><td><code>on / off / toggle / set</code></td><td><code>{ power, mode, targetTemp, fan }</code></td></tr>
       <tr><td>camera</td><td><code>set / pan / nudge / arm</code></td><td><code>{ power, streaming, armed }</code> / <code>{ pan }</code> / <code>{ delta }</code> / <code>{ armed }</code></td></tr>
+      <tr><td>curtain</td><td><code>open / close / toggle / set</code></td><td><code>{ position }</code>（0–100，100 为全开、0 为全闭）</td></tr>
       <tr><td>lock</td><td><code>lock / unlock</code></td><td>可选 <code>{ person }</code></td></tr>
     </table>
 
@@ -360,11 +389,16 @@
       通道分配：客厅摄像头 <code>233666</code>，大门人脸锁 <code>233667</code>。
       先用 <code>command</code> 发 <code>stream: { on: true }</code> 开启推流，再打开 <code>&lt;img&gt;</code>。
     </p>
+    <p class="note">
+      客厅画面里画着入户门：门锁 <code>unlock</code> 后门扇会向室内转开，门洞透出室外光线；
+      左下角常驻 <code>DOOR OPEN</code> / <code>DOOR LOCKED</code> 状态牌，云台转到任何角度都能判断门是否开着。
+    </p>
 
     <h3>4.5 在线测试</h3>
     <p>
       下面是一个可直接运行的 WebSocket 调试器。点击「连接」后，先在下拉菜单里选择设备，再选择动作，
       报文会自动生成，点击「发送」即可控制房子。
+      （温湿度传感器只上报遥测、不接受命令，因此不在可控设备列表里，其数值随 <code>snapshot</code> 下发。）
     </p>
     <div class="ws-tester">
       <div class="ws-row">
@@ -443,6 +477,11 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
       把客厅摄像头画面来源改成真实摄像头，即可在三维沙盘中看到真实房间画面。
       服务端做来源切换，客户端一行代码不用改。
     </p>
+    <p>
+      网关没有摄像头也没关系：选「浏览器摄像头」，用手机或笔记本的摄像头就能演示真实人脸开锁 ——
+      画面由浏览器 <code>getUserMedia</code> 抓帧后 <code>POST /api/lock/frame</code> 推给网关，
+      走的仍然是「信令走 WebSocket、像素走 HTTP」这一套分工，只是方向反过来。
+    </p>
 
     <h3>6.4 教学用途</h3>
     <ul>
@@ -470,7 +509,7 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
 
       function envelope(type, payload) {
         // v 必须与网关主版本一致，否则被以 PROTOCOL_MISMATCH 拒绝（close 4426）
-        return { v: "2.0", type, id: nextId(), ts: Date.now(), payload };
+        return { v: "1.0.0", type, id: nextId(), ts: Date.now(), payload };
       }
 
       function log(cls, text) {
@@ -496,6 +535,7 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
         { id: 'ac.living', name: '客厅空调', type: 'ac' },
         { id: 'ac.bedroom', name: '卧室空调', type: 'ac' },
         { id: 'camera.living', name: '客厅云台', type: 'camera' },
+        { id: 'curtain.bedroom', name: '主卧电动窗帘', type: 'curtain' },
         { id: 'lock.entry', name: '大门人脸锁', type: 'lock' },
         { id: '_scene', name: '场景', type: 'scene' },
       ];
@@ -520,6 +560,12 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1</code></pre>
         lock: [
           { action: 'lock', label: '上锁', params: {} },
           { action: 'unlock', label: '开锁', params: {} },
+        ],
+        curtain: [
+          { action: 'open', label: '全开（100%）', params: {} },
+          { action: 'close', label: '全闭（0%）', params: {} },
+          { action: 'set', label: '设置开度（0–100）', params: { position: 60 } },
+          { action: 'toggle', label: '翻转开合', params: {} },
         ],
         scene: [
           { action: 'home', label: '回家', params: { sceneId: 'home' } },

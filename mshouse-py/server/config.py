@@ -61,7 +61,7 @@ class StreamConfig:
 @dataclass(frozen=True)
 class SecurityConfig:
     """
-    鉴权配置（v2.0 新增）。
+    鉴权配置。
 
     设计取舍：默认值全部取「安全的一侧」——
       · token 为空时**启动失败**，而不是回落到「空令牌放行」

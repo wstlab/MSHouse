@@ -7,11 +7,10 @@ MSHouse 镜像家居 · 物模型与协议常量（Mirror Space 智能家居教�
 从这里的定义生成，避免「同一份物模型维护两份」的经典漂移问题。
 新增设备时：补一条 DEVICE_CATALOG，再在前端注册一个渲染器即可。
 
-v2.0 起，本文件除「设备有哪些字段」外，还负责声明**设备行为参数**：
+本文件除「设备有哪些字段」外，还负责声明**设备行为参数**：
 上报阈值（对应 Zigbee 的 ReportableChange / MinReportingInterval /
 MaxReportingInterval）、执行延迟、心跳周期、字段取值约束。
-这些参数以前散落在 gateway.py 里硬编码，现在集中于此，
-才能做到「改一处、前后端与文档同时生效」。
+集中于此才能做到「改一处、前后端与文档同时生效」。
 """
 
 from __future__ import annotations
@@ -21,10 +20,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # 版本号
-# 1.0 → 2.0 的破坏性变更：
-#   · state 中不再包含 comfort（派生量移入 derived 命名空间）
-#   · ack.error 由字符串升级为结构化对象（过渡期双写 errorInfo）
-#   · state 报文新增 stateKind（delta / full / confirmed）
 # 主版本不一致的客户端会被网关以 PROTOCOL_MISMATCH 拒绝，
 # 避免「新旧客户端各读一半字段」产生难查的显示错乱。
 PROTOCOL_VERSION = "2.0"
@@ -58,7 +53,6 @@ class MSG:
     SETUP = "setup"
     SETUP_AUTH = "setupAuth"
     FACE_ENROLL = "faceEnroll"
-    # v2.0 新增
     RESYNC = "resync"   # 客户端发现序号跳号后请求全量对齐
     FAULT = "fault"     # 设备级故障上报
     OTA = "ota"         # 固件升级状态机
@@ -195,6 +189,8 @@ DEVICE_CATALOG: tuple[DeviceSpec, ...] = (
     DeviceSpec("ac.bedroom", "ac", "卧室空调", "bedroom", 2, ("switch", "mode", "targetTemp", "fan")),
     DeviceSpec("camera.living", "camera", "客厅云台摄像头", "living", 1, ("switch", "pan", "stream"), "233666"),
     DeviceSpec("lock.entry", "lock", "大门人脸锁", "entry", 1, ("lock", "stream"), "233667"),
+    # 电动窗帘：position 是开度百分比（0 = 完全闭合遮光，100 = 完全拉开）
+    DeviceSpec("curtain.bedroom", "curtain", "主卧电动窗帘", "bedroom", 2, ("switch", "position")),
 )
 
 
@@ -221,6 +217,7 @@ FIELD_LIMITS: dict[str, tuple[str, float, float]] = {
     "targetTemp": ("int", 16, 30),
     "indoorTemp": ("float", -20, 60),
     "pan": ("float", 0, 360),
+    "position": ("int", 0, 100),    # 窗帘开度百分比
     "delta": ("float", -180, 180),   # camera nudge 的步进量
 }
 
@@ -233,6 +230,7 @@ FIELD_CAPABILITY: dict[str, str] = {
     "targetTemp": "targetTemp",
     "fan": "fan",
     "pan": "pan",
+    "position": "position",
     "streaming": "stream",
     "locked": "lock",
 }
@@ -300,6 +298,9 @@ DEVICE_BEHAVIOR: dict[str, dict[str, Any]] = {
     "camera": {"execLatencyMs": 300, "heartbeatInterval": 30, "offlineThreshold": 3},
     "lock": {"execLatencyMs": 1500, "heartbeatInterval": 60, "offlineThreshold": 3},
     "sensor": {"execLatencyMs": 0, "heartbeatInterval": 60, "offlineThreshold": 3},
+    # 窗帘：行程耗时比继电器长得多（3.6 m 的轨道全开约 1.5 秒），
+    # 这也是为什么它必须走两阶段提交 —— 收到指令与到位之间隔着一秒多。
+    "curtain": {"execLatencyMs": 1500, "heartbeatInterval": 60, "offlineThreshold": 3},
 }
 
 # 器件特征：分辨率与精度。上报值会被量化到分辨率，

@@ -5,10 +5,14 @@
  *
  * 视频：WebSocket 只承载「流信令」（通道名 / 是否在推 / 云台角），
  *       像素由 /?stream=<通道> 这个 HTTP 长连接提供，两条通道互不干扰。
+ *
+ * 浏览器摄像头：像素同样走 HTTP，只是方向反过来 —— 浏览器把摄像头帧
+ *       POST 给网关（/api/lock/frame），网关渲染进大门锁通道并做 SFace 识别。
  */
-import { envelope, nextId } from "./protocol.js?v=24";
-import { MSHouseScene } from "./scene.js?v=24";
-import { Dashboard } from "./ui.js?v=24";
+import { envelope, nextId } from "./protocol.js?v=25";
+import { MSHouseScene } from "./scene.js?v=25";
+import { Dashboard } from "./ui.js?v=25";
+import { BrowserCamera } from "./browser-camera.js?v=25";
 
 const OCCUPANCY = { home: "在家", away: "离家", sleep: "睡眠" };
 
@@ -17,6 +21,7 @@ const state = {
   scene: "home",
   occupancy: "home",
   streams: new Map(),
+  lockSource: null,     // 大门锁画面来源 { kind, index, url }
 };
 
 // 每次「打开首页」（整页加载）只欢迎一次；WebSocket 断线重连不再重复提示
@@ -47,6 +52,7 @@ function makeFallbackScene(reason) {
 let scene;
 try {
   scene = new MSHouseScene(document.getElementById("viewport"));
+  if (typeof window !== "undefined") window.__mshouseScene = scene;
 } catch (err) {
   console.error("[mshouse] 三维场景初始化失败：", err);
   scene = makeFallbackScene(err?.message || String(err));
@@ -65,8 +71,14 @@ const ui = new Dashboard({
     pendingAuthAcks.add(id);
     send(envelope("setupAuth", { password }, { id }));
   },
-  uploadFace: (file) => uploadFace(file),
-  clearFace: () => clearFace(),
+  refreshFaces: () => refreshFaces(),
+  enrollFace: (name, blob) => enrollFace(name, blob),
+  removeFace: (name) => removeFace(name),
+  captureEnroll: (name) => captureEnroll(name),
+  startBrowserCam: () => startBrowserCam(),
+  stopBrowserCam: () => stopBrowserCam(),
+  selectBrowserDevice: (id) => selectBrowserDevice(id),
+  listBrowserCams: () => refreshBrowserCamDevices(),
 });
 
 scene.onSelect((id) => {
@@ -130,7 +142,6 @@ function connect() {
   const token = resolveToken();
   ui.setConnection(false, retry ? `重连中 (${retry})` : "连接中");
   // 浏览器不允许给 WebSocket 加自定义请求头，子协议是唯一能携带凭据的地方。
-  // 这也是 v2.0 要求客户端配合改动的唯一一处。
   const protocols = token ? ["mshouse.v1", `bearer.${token}`] : ["mshouse.v1"];
   const socket = new WebSocket(`${proto}://${location.host}/ws`, protocols);
   ws = socket;
@@ -257,6 +268,10 @@ function handle(msg) {
       const p = msg.payload || {};
       if (p.status === "ask") ui.showEnrollPrompt(p);
       else ui.hideEnrollPrompt(p);
+      // 门外登记成功/取消后，设置里的登记库列表也要跟着变
+      if (p.status === "enrolled" || p.status === "canceled" || p.status === "dismissed") {
+        refreshFaces();
+      }
       break;
     }
     case "setup":
@@ -322,7 +337,9 @@ function applySnapshot(snap) {
   ui.setOccupancy(OCCUPANCY[snap.occupancy] || snap.occupancy);
   ui.setOutdoor(`${snap.outdoor.temp.toFixed(1)}°C / ${Math.round(snap.outdoor.humidity)}%`);
   ui.setSite(snap.site);
+  state.lockSource = snap.lock?.source || null;
   ui.setLockSource(snap.lock?.source);
+  syncBrowserCamera();
   if (snap.lock?.enroll) ui.showEnrollPrompt(snap.lock.enroll);
   else ui.hideEnrollPrompt(null);
   ui.setOnline(`${snap.devices.filter((d) => d.online).length}/${snap.devices.length}`);
@@ -344,7 +361,7 @@ function applySnapshot(snap) {
 /**
  * 应用一条状态报文。
  *
- * v2.0 起服务端默认只发「变化的字段」（stateKind = delta），
+ * 服务端默认只发「变化的字段」（stateKind = delta），
  * 所以这里必须先与本地状态**合并**再交给界面 ——
  * 直接覆盖会把这次没变化的字段全部抹成 undefined。
  */
@@ -364,6 +381,7 @@ function applyDeviceState(payload) {
   }
   scene.applyDeviceState({ ...payload, state: merged });
   ui.updateDevice(payload.deviceId, merged, d, payload.derived);
+  if (payload.deviceId === "lock.entry") syncBrowserCamera();
 }
 
 /* ---------------- 画面（HTTP 流） ---------------- */
@@ -393,14 +411,17 @@ function applyVideoSignal(p) {
     ].join(" · "));
   } else if (p.kind === "lock") {
     const r = p.result === "pass" ? "识别通过" : p.result === "reject" ? "识别拒绝" : p.locked ? "已上锁" : "已开锁";
-    const srcDesc = p.source
-      ? (p.source.kind === "camera" ? `本机摄像头 #${p.source.target?.split("#")[1] || p.source.target || ""}`
-        : p.source.kind === "stream" ? "网络视频流"
-        : "静态画面")
-      : null;
-    const srcState = p.source && p.source.kind !== "image"
-      ? (p.source.opened ? "" : `（${p.live ? "连接失败" : "未连接"}）`)
-      : "";
+    const kind = p.source?.kind;
+    const srcDesc = !kind ? null
+      : kind === "camera" ? `本机摄像头 #${p.source.target?.split("#")[1] || p.source.target || ""}`
+      : kind === "stream" ? "网络视频流"
+      : kind === "browser" ? "浏览器摄像头"
+      : "静态画面";
+    // 浏览器摄像头「未连接」的含义是「本页还没开始推帧」，提示要说人话
+    const srcState = !p.source || kind === "image" ? ""
+      : p.source.opened ? ""
+      : kind === "browser" ? `（${p.live ? "等待本页推流" : "未连接"}）`
+      : `（${p.live ? "连接失败" : "未连接"}）`;
     const phaseMap = { DAWN: "黎明", DAY: "白天", DUSK: "黄昏", NIGHT: "夜间" };
     ui.setVideoMeta("lock.entry", [
       r,
@@ -415,46 +436,186 @@ function applyVideoSignal(p) {
   }
 }
 
-/* ---------------- 大门锁：上传 / 移除人脸画面 ---------------- */
-async function uploadFace(file) {
-  ui.setVideoMeta("lock.entry", `正在上传「${file.name}」…`);
+/* ---------------- 大门锁：人脸登记库（设置弹窗「人脸锁」卡片） ---------------- */
+
+/** 拉取登记库现状（模型 / 阈值 / 已登记用户），刷新设置卡片 */
+async function refreshFaces() {
   try {
-    const res = await fetch("/api/lock/face", {
-      method: "POST",
-      headers: { "Content-Type": file.type || "image/jpeg" },
-      body: file,
-    });
+    const res = await fetch("/api/lock/faces");
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) {
-      ui.toast("人脸画面上传失败：" + (data.error || res.status));
-      return;
-    }
-    // 内置模型的比对结果：matched + 距离/阈值；状态行随后续 video 信令自动刷新
-    if (data.recognitionReady === false) {
-      ui.toast("画面已上传，但识别模型未就绪：" + (data.reason || ""));
-    } else if (data.matched) {
-      ui.toast(`识别通过：距离 ${data.distance} ≤ 阈值 ${data.threshold}，门锁已打开`);
-    } else if (data.distance != null) {
-      ui.toast(`识别拒绝：距离 ${data.distance} > 阈值 ${data.threshold}，大门保持锁定`);
-    } else {
-      ui.toast("画面已上传，但没有检测到正脸");
-    }
-  } catch (err) {
-    ui.toast("人脸画面上传失败：" + err.message);
+    if (res.ok) ui.setFaceInfo(data);
+  } catch {
+    /* 网关离线时保持现状，卡片留着上一次的结果比清空更好 */
   }
 }
 
-async function clearFace() {
+/**
+ * 登记一个新用户。
+ *
+ * 口令走请求头：HTTP 端点没有 WebSocket 那样的会话可挂鉴权，
+ * 而设置弹窗里刚刚已经验证过一次口令了，直接复用，不让用户输两遍。
+ */
+async function enrollFace(name, blob) {
+  const label = (name || "").trim() || "新住户";
+  ui.setFaceEnrollBusy(true, `正在登记「${label}」…`);
   try {
-    const res = await fetch("/api/lock/face", { method: "DELETE" });
+    const res = await fetch(`/api/lock/enroll?name=${encodeURIComponent(name || "")}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": blob.type || "image/jpeg",
+        "X-Setup-Password": ui.setupPassword(),
+      },
+      body: blob,
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) {
-      ui.toast("恢复门外画面失败：" + (data.error || res.status));
+      const why = data.error || `HTTP ${res.status}`;
+      ui.setFaceEnrollBusy(false, null, why);
+      ui.toast("人脸登记失败：" + why);
+      return false;
+    }
+    ui.setFaceInfo(data);
+    ui.setFaceEnrollBusy(false, `已登记「${data.name}」，现在共 ${(data.enrolled || []).length} 人`);
+    ui.toast(`已登记人脸用户：${data.name}`);
+    return true;
+  } catch (err) {
+    ui.setFaceEnrollBusy(false, null, err.message);
+    ui.toast("人脸登记失败：" + err.message);
+    return false;
+  }
+}
+
+/** 用浏览器摄像头当前画面抓一帧去登记（摄像头没开就提示先开） */
+async function captureEnroll(name) {
+  const blob = await browserCam.capture();
+  if (!blob) {
+    ui.toast("抓拍失败：浏览器摄像头还没有画面，先点「开启摄像头」");
+    return;
+  }
+  await enrollFace(name, blob);
+}
+
+/** 删除一个登记用户（连带删掉磁盘上的人脸图，重启也不会复活） */
+async function removeFace(name) {
+  if (!window.confirm(`确定删除登记用户「${name}」？删除后这张脸将不再被识别。`)) return;
+  try {
+    const res = await fetch(`/api/lock/enroll?name=${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: { "X-Setup-Password": ui.setupPassword() },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      ui.toast("删除失败：" + (data.error || res.status));
       return;
     }
-    ui.toast("已恢复门外草坪道路画面");
+    ui.setFaceInfo(data);
+    ui.toast(data.message || `已删除登记用户「${name}」`);
   } catch (err) {
-    ui.toast("恢复门外画面失败：" + err.message);
+    ui.toast("删除失败：" + err.message);
+  }
+}
+
+/* ---------------- 大门锁：浏览器摄像头推流 ---------------- */
+/**
+ * 浏览器摄像头与「画面来源 = browser」联动：
+ *   kind === "browser" 且大门锁处于推流状态  → 持续把摄像头帧 POST 给网关；
+ *   否则                                    → 立即停止（摄像头指示灯熄灭）。
+ *
+ * 授权提示是浏览器弹出的模态框，用户没点过就不该主动弹 —— 所以
+ * 自动恢复只在权限**已经授予**时才做，否则等用户点按钮。
+ */
+const browserCam = new BrowserCamera({
+  onStatus: (status) => ui.setBrowserCamStatus(status),
+});
+
+// 设置弹窗里的浏览器摄像头预览（同一个 MediaStream 也能挂多个 <video>）
+browserCam.attachPreview(document.getElementById("setupLockBrowserPreview"));
+
+let browserCamWanted = false;   // 上一轮「该不该推流」，用于识别 false→true 的边沿
+
+function lockStreaming() {
+  return !!state.devices.get("lock.entry")?.state?.streaming;
+}
+
+function browserSourceActive() {
+  return (state.lockSource?.kind || "image") === "browser";
+}
+
+async function refreshBrowserCamDevices() {
+  const devices = await browserCam.listDevices();
+  ui.setBrowserCamDevices(devices, browserCam.deviceId);
+  return devices;
+}
+
+async function startBrowserCam() {
+  const ok = await browserCam.start();
+  if (ok) {
+    browserCamWanted = true;
+    await refreshBrowserCamDevices();
+    if (!lockStreaming()) {
+      ui.toast("摄像头已开启。点「推送画面」后网关才会开始识别");
+    }
+  }
+  return ok;
+}
+
+function stopBrowserCam() {
+  browserCamWanted = false;
+  browserCam.stop();
+}
+
+async function selectBrowserDevice(deviceId) {
+  browserCam.setDevice(deviceId);
+  if (browserCam.running) {
+    browserCam.stop();
+    await browserCam.start();
+  }
+  await refreshBrowserCamDevices();
+}
+
+/**
+ * 挂载 / 卸载推流：状态或来源一变就调用一次，幂等。
+ *
+ *   active（来源 = 浏览器摄像头）     → 摄像头允许开着
+ *   want（active 且门锁在推流）       → 允许把帧 POST 给网关
+ */
+async function syncBrowserCamera() {
+  const active = browserSourceActive();
+  const want = active && lockStreaming();
+  const justWanted = want && !browserCamWanted;
+  const wasPushing = browserCam.setPushing(want);
+  browserCamWanted = want;
+
+  if (!active) {
+    // 画面来源不再是浏览器摄像头：把设备还回去（指示灯熄灭）
+    if (browserCam.running) browserCam.stop();
+    return;
+  }
+  if (!want) {
+    // 刚停了推流：顺手关掉摄像头（隐私上更稳妥）；
+    // 只是预览、还没推过帧的，就留着不动
+    if (wasPushing && browserCam.running) browserCam.stop();
+    return;
+  }
+  if (browserCam.running || !justWanted) return;
+
+  // 只在权限已授予时自动恢复，避免刷新页面就弹一个权限框
+  if (!(await cameraPermissionGranted())) {
+    ui.setBrowserCamStatus({ running: false, pushing: false, error: null });
+    const node = document.getElementById("lockBrowserStatus");
+    if (node) node.textContent = "画面来源是「浏览器摄像头」，请点上方「开启浏览器摄像头」授权后开始推流。";
+    return;
+  }
+  await startBrowserCam();
+}
+
+async function cameraPermissionGranted() {
+  try {
+    if (!navigator.permissions?.query) return false;
+    const st = await navigator.permissions.query({ name: "camera" });
+    return st.state === "granted";
+  } catch {
+    return false;   // Safari / Firefox 不支持查询 camera 权限，交给用户点按钮
   }
 }
 
@@ -476,7 +637,7 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------------- 连接设置（v2.0：/ws 需要访问令牌） ---------------- */
+/* ---------------- 连接设置（/ws 需要访问令牌） ---------------- */
 
 const connDialog = document.getElementById("connDialog");
 const connToken = document.getElementById("connToken");

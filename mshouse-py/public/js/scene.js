@@ -21,6 +21,12 @@ const GROUND_Y = -0.3;
 const DOOR_X = -3.4;              // 入户门中心
 const DOOR_W = 1.2, DOOR_H = 2.15;
 
+// 二楼主卧落地窗（相对二层地面 Y2 的高度），窗帘与窗洞共用这一份参数，
+// 避免「窗改大了、窗帘还按老尺寸做」的错位。
+const BR_WIN = { x0: -5.25, x1: -1.75, bottom: 0.12, top: 2.6 };
+// 二层楼梯口（一层直跑梯上来的洞口），尺寸与一层 _buildStairs 对齐
+const STAIR_WELL = { x0: X0 - 0.1, x1: X0 + 1.6, z0: Z0 - 0.1, z1: Z0 + 3.5 };
+
 const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
 const lerp = (a, b, t) => a + (b - a) * t;
 
@@ -505,32 +511,101 @@ export class MSHouseScene {
     this._box(X1 - PART, 0.05, Z1 - Z0, this.mats.tileUpper, (PART + X1) / 2, Y2 + 0.025, 0, g, { shadow: false });
 
     const win = (from, to, b, t) => ({ from, to, bottom: Y2 + b, top: Y2 + t });
-    this._wall({ axis: "x", at: Z1, from: X0, to: X1, base: Y2, holes: [win(-4.4, -2.6, 0.95, 2.35), win(3.1, 4.7, 1.3, 2.4)], group: g, tag: "front" });
+    this._wall({ axis: "x", at: Z1, from: X0, to: X1, base: Y2, holes: [
+      // 主卧朝前改为大落地窗：近地面 12cm 起，到 2.6m 高（层高 3.0，上方留过梁）
+      { from: BR_WIN.x0, to: BR_WIN.x1, bottom: Y2 + BR_WIN.bottom, top: Y2 + BR_WIN.top },
+      win(3.1, 4.7, 1.3, 2.4),
+    ], group: g, tag: "front" });
     this._wall({ axis: "x", at: Z0, from: X0, to: X1, base: Y2, holes: [win(-1.4, 0.6, 0.95, 2.35)], group: g });
     this._wall({ axis: "z", at: X0, from: Z0, to: Z1, base: Y2, holes: [win(-1.8, 0.6, 0.95, 2.35)], group: g });
     this._wall({ axis: "z", at: X1, from: Z0, to: Z1, base: Y2, holes: [win(-0.6, 1.0, 1.4, 2.4)], group: g });
     // 内隔墙
     this._wall({ axis: "z", at: PART, from: Z0, to: Z1, base: Y2, holes: [{ from: -0.8, to: 0.6, bottom: Y2, top: Y2 + 2.1, door: true }], group: g });
 
+    this._buildStairOpening(g);
     this._buildBedroomFurniture(g);
     this._buildBathFurniture(g);
   }
 
+  /**
+   * 二楼的楼梯入口。
+   *
+   * 楼梯本体建在一层（_buildStairs），二层只是「楼板破了个洞」——
+   * 没有护栏、没有门洞、顶端最后一级与二层地面之间还留着一道缝，
+   * 看上去不像能走人，更不像「入口」。这里补齐四样东西：
+   *   ① 与二层地面齐平的收口平台（把缝补上）
+   *   ② 洞口边缘的收口包边（标出「这里是洞」）
+   *   ③ 右侧通长护栏 + 靠墙扶手（不会一脚踏空）
+   *   ④ 洞口前缘的门洞（立柱 + 过梁），让「从这儿进二楼」一眼可读
+   */
+  _buildStairOpening(g) {
+    const { x0, x1, z0, z1 } = STAIR_WELL;
+    const rail = this.mats.metal;
+    const edge = this.mats.frame;
+    // 楼梯踏步的起止（与一层 _buildStairs 的 sx0/sx1/zStart 对齐）
+    const sx0 = X0 + 0.1, sx1 = X0 + 1.5, zTop = Z0 + 0.15 + 3.2;
+
+    // ① 收口平台：楼梯顶面和二层地面之间那道 15cm 的缝
+    this._box(sx1 - sx0, 0.06, (z1 - zTop) + 0.12, this.mats.slabUpper,
+      (sx0 + sx1) / 2, Y2 - 0.03, (zTop + z1) / 2, g, { shadow: false });
+
+    // ② 洞口收口包边（只包临空的两侧，另两侧是外墙）
+    this._box(0.08, 0.06, z1 - z0, edge, x1 + 0.04, Y2 + 0.03, (z0 + z1) / 2, g, { shadow: false });
+    this._box(x1 - x0, 0.06, 0.08, edge, (x0 + x1) / 2, Y2 + 0.03, z1 - 0.04, g, { shadow: false });
+
+    // ③ 右侧通长护栏（洞的临空长边）+ 靠墙扶手（贴左外墙）
+    const posts = 7;
+    for (let i = 0; i <= posts; i++) {
+      const z = z0 + (z1 - z0) * (i / posts);
+      this._box(0.05, 1.05, 0.05, rail, x1 + 0.08, Y2 + 0.53, z, g, { shadow: false });
+    }
+    this._box(0.06, 0.06, z1 - z0, rail, x1 + 0.08, Y2 + 1.05, (z0 + z1) / 2, g, { shadow: false });
+    this._box(0.05, 0.05, z1 - z0 - 0.2, rail, X0 + 0.14, Y2 + 1.0, (z0 + z1) / 2 + 0.1, g, { shadow: false });
+    for (const z of [z0 + 0.3, z1 - 0.3]) {
+      this._box(0.1, 0.05, 0.05, rail, X0 + 0.14, Y2 + 1.0, z, g, { shadow: false });
+    }
+
+    // ④ 门洞：立柱贴洞口两侧，过梁压在 2.25m 处 —— 净宽与楼梯同宽
+    const jambL = sx0 - 0.05, jambR = sx1 + 0.05;
+    const jambH = 2.25;
+    for (const [jx, jw] of [[jambL, 0.12], [jambR, 0.12]]) {
+      this._box(jw, jambH, 0.14, this.mats.wallIn, jx, Y2 + jambH / 2, z1, g);
+    }
+    this._box(jambR - jambL + 0.12, 0.26, 0.14, this.mats.wallIn, (jambL + jambR) / 2, Y2 + jambH + 0.13, z1, g);
+    // 门套压条
+    this._box(jambR - jambL + 0.12, 0.05, 0.16, edge, (jambL + jambR) / 2, Y2 + jambH + 0.02, z1, g, { shadow: false });
+
+    // 楼梯口标识：与房间名同一套 Sprite 规则（有屋顶时自动隐藏）
+    const tag = new Label({
+      text: "楼梯口", worldHeight: 0.34, color: "#e8efe9",
+      bg: "rgba(10,16,14,.72)", accent: "rgba(226,177,90,.5)",
+      font: "700 68px 'PingFang SC','Noto Sans SC',sans-serif",
+    });
+    tag.sprite.position.set((jambL + jambR) / 2, Y2 + jambH + 0.55, z1 - 0.05);
+    tag.sprite.material.depthTest = false;
+    tag.sprite.renderOrder = 900;
+    tag.floor = 2;
+    this.levels[2].add(tag.sprite);
+    this.roomLabels.push(tag);
+  }
+
   _buildBedroomFurniture(g) {
-    const bx = -4.1, bz = -1.3;
-    this._box(2.1, 0.34, 2.2, this.mats.wood2, bx, Y2 + 0.22, bz, g);
-    this._box(2.0, 0.28, 2.1, this.mats.white, bx, Y2 + 0.53, bz, g);
-    this._box(2.1, 0.85, 0.14, this.mats.fabric2, bx, Y2 + 0.65, bz - 1.14, g);
-    this._box(0.62, 0.16, 0.4, this.mats.white, bx - 0.5, Y2 + 0.72, bz - 0.78, g, { shadow: false });
-    this._box(0.62, 0.16, 0.4, this.mats.white, bx + 0.5, Y2 + 0.72, bz - 0.78, g, { shadow: false });
-    this._box(2.0, 0.12, 0.9, this.mats.fabric, bx, Y2 + 0.72, bz + 0.55, g, { shadow: false });
-    // 床头柜 + 衣柜 + 书桌
-    this._box(0.5, 0.5, 0.45, this.mats.wood2, bx - 1.4, Y2 + 0.3, bz - 1.1, g);
-    this._box(0.5, 0.5, 0.45, this.mats.wood2, bx + 1.4, Y2 + 0.3, bz - 1.1, g);
+    // 楼梯口在西北角（x ≤ -4.4、z ≤ -1.0）。床靠东侧隔墙、床头朝东：
+    // 与楼梯洞口分处房间两端，同时把朝南的落地窗完整让出来。
+    const bx = 0.22, bz = 2.35;
+    this._box(2.2, 0.34, 2.1, this.mats.wood2, bx, Y2 + 0.22, bz, g);
+    this._box(2.1, 0.28, 2.0, this.mats.white, bx, Y2 + 0.53, bz, g);
+    this._box(0.14, 0.85, 2.1, this.mats.fabric2, bx + 1.14, Y2 + 0.65, bz, g);
+    this._box(0.4, 0.16, 0.62, this.mats.white, bx + 0.78, Y2 + 0.72, bz - 0.5, g, { shadow: false });
+    this._box(0.4, 0.16, 0.62, this.mats.white, bx + 0.78, Y2 + 0.72, bz + 0.5, g, { shadow: false });
+    this._box(0.9, 0.12, 2.0, this.mats.fabric, bx - 0.55, Y2 + 0.72, bz, g, { shadow: false });
+    // 床头柜（贴东墙）+ 衣柜（北墙）+ 书桌（西墙窗下）
+    this._box(0.45, 0.5, 0.5, this.mats.wood2, bx + 0.98, Y2 + 0.3, bz - 1.4, g);
+    this._box(0.45, 0.5, 0.5, this.mats.wood2, bx + 0.98, Y2 + 0.3, bz + 1.4, g);
     this._box(2.4, 2.1, 0.6, this.mats.wood2, -1.0, Y2 + 1.08, Z0 + 0.42, g);
-    this._box(1.3, 0.06, 0.6, this.mats.wood2, -0.2, Y2 + 0.76, 3.3, g);
-    this._box(0.42, 0.45, 0.42, this.mats.fabric, -0.2, Y2 + 0.24, 2.6, g, { shadow: false });
-    const rug2 = this._box(3.0, 0.02, 2.0, this._mat(0x6b5f52, { roughness: 1 }), -2.6, Y2 + 0.07, 1.4, g, { shadow: false });
+    this._box(0.6, 0.06, 1.3, this.mats.wood2, -5.55, Y2 + 0.76, 0.55, g);
+    this._box(0.42, 0.45, 0.42, this.mats.fabric, -4.9, Y2 + 0.24, 0.55, g, { shadow: false });
+    const rug2 = this._box(2.4, 0.02, 2.2, this._mat(0x6b5f52, { roughness: 1 }), -1.0, Y2 + 0.07, 2.35, g, { shadow: false });
     rug2.receiveShadow = true;
   }
 
@@ -654,6 +729,9 @@ export class MSHouseScene {
 
     this._acDevice("ac.living", new THREE.Vector3(X0 + 0.22, 2.35, 2.5), this.levels[1], 1);
     this._acDevice("ac.bedroom", new THREE.Vector3(X0 + 0.22, Y2 + 2.35, 2.5), this.levels[2], 1);
+    // 电动窗帘贴着落地窗内侧挂，位置与 BR_WIN 对齐
+    this._curtainDevice("curtain.bedroom",
+      new THREE.Vector3((BR_WIN.x0 + BR_WIN.x1) / 2, Y2, Z1 - 0.3), this.levels[2]);
 
     // 摄像头挂在 root 而不是楼层组：楼层组在全屋视图会被整体挪开，镜头必须留在建筑真实坐标
     this._cameraDevice("camera.living", new THREE.Vector3(-0.6, 2.72, Z0 + 0.42), this.root);
@@ -714,6 +792,73 @@ export class MSHouseScene {
         bulbMat.emissiveIntensity = 1.6 * cur.b;
         shadeMat.emissiveIntensity = 0.9 * cur.b;
         glowSprite.material.opacity = 0.55 * cur.b;
+      },
+    });
+  }
+
+  /**
+   * 电动窗帘。
+   *
+   * 开度是「百分比」而不是开关量：真实电动窗帘电机给的也是行程百分比，
+   * 半开（遮光但不全黑）是每天都用得到的状态。
+   * 每片帘子用 4 条竖向褶皱条拼出来 —— 拉开时整体横向压缩、褶皱变密，
+   * 这比单纯移动一整块板更像布，代价只是多几个 box。
+   */
+  _curtainDevice(id, pos, level) {
+    const { g, halo } = this._deviceGroup(id, pos, level);
+    const W = BR_WIN.x1 - BR_WIN.x0;
+    const H = BR_WIN.top - BR_WIN.bottom;
+    const topY = BR_WIN.top;
+    halo.position.y = BR_WIN.bottom + H / 2;
+
+    // 帘杆与两端支架
+    this._box(W + 0.7, 0.06, 0.06, this.mats.metal, 0, topY + 0.14, 0, g, { shadow: false });
+    for (const sx of [-1, 1]) {
+      this._box(0.07, 0.18, 0.07, this.mats.metal, sx * (W / 2 + 0.32), topY + 0.22, 0, g, { shadow: false });
+    }
+
+    const cloth = new THREE.MeshStandardMaterial({
+      color: 0xe3d8c2, roughness: 0.96, metalness: 0, side: THREE.DoubleSide,
+    });
+    const mkPanel = () => {
+      const panel = new THREE.Group();
+      const stripes = 4;
+      for (let i = 0; i < stripes; i++) {
+        const w = 1 / stripes;
+        const cx = -0.5 + w * (i + 0.5);
+        const bulge = i % 2 === 0 ? 0.032 : -0.022;   // 交替前后，形成波浪褶皱
+        this._box(w * 0.98, H, 0.05, cloth, cx, 0, bulge, panel, { shadow: false });
+      }
+      panel.position.y = BR_WIN.bottom + H / 2;
+      g.add(panel);
+      return panel;
+    };
+    const left = mkPanel();
+    const right = mkPanel();
+
+    const apply = (t) => {
+      // 闭合：两片各占半扇并略微重叠；拉开：压缩到窗侧成褶皱堆
+      const w = lerp(W / 2 + 0.06, 0.5, t);
+      const off = lerp(W / 4, W / 2 + 0.1, t);
+      left.scale.x = w;
+      right.scale.x = w;
+      left.position.x = -off;
+      right.position.x = off;
+    };
+    apply(1);
+
+    this.deviceViews.set(id, {
+      id, type: "curtain", group: g, halo,
+      update(state, animate = true) {
+        this.target = clamp((state.position ?? 100) / 100, 0, 1);
+        if (!animate) this.snap();
+      },
+      snap() { this.cur = this.target; apply(this.target); },
+      tick(dt) {
+        if (this.target == null) return;
+        const cur = this.cur ?? (this.cur = this.target);
+        this.cur = lerp(cur, this.target, Math.min(1, dt * 3.2));
+        apply(this.cur);
       },
     });
   }
@@ -949,7 +1094,13 @@ export class MSHouseScene {
     this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObjects(this.deviceRoot.children, true);
+    // 设备视图挂在 levels[1]/levels[2] 上（随楼层显隐），deviceRoot 只作容器，
+    // 所以拾取要扫楼层组，否则点设备永远选不中。只扫当前可见的楼层，
+    // 避免隔着楼板选中被隐藏那一层的设备。
+    const groups = this.floorMode === "1" ? [this.levels[1]]
+      : this.floorMode === "2" ? [this.levels[2]]
+        : [this.levels[1], this.levels[2]];
+    const hits = this.raycaster.intersectObjects(groups, true);
     for (const h of hits) {
       let o = h.object;
       while (o && !o.userData.deviceId) o = o.parent;
@@ -1070,3 +1221,7 @@ export class MSHouseScene {
     step();
   }
 }
+
+// 仅供自检脚本在浏览器里读 scene 实例，名字带下划线表示"内部用"。
+// 产品代码不会读这个，挂到 window 上也没有副作用。
+if (typeof window !== "undefined") window.__mshouseScene = null;

@@ -12,7 +12,7 @@ export {
   envelope,
   deviceById,
   roomById,
-} from "/shared/model.js";
+} from "/shared/model.js?v=25";
 
 let seq = 1;
 

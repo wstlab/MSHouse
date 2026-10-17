@@ -7,8 +7,18 @@
 #   fastapi + uvicorn   HTTP / WebSocket / 静态资源
 #   numpy + pillow      软光栅渲染与 JPEG 编码（Pillow 的绘制与编码都是 C 实现，
 #                       这是 Python 版性能反超 Node 版的关键）
+#   opencv-python       大门锁人脸识别与画面源：
+#                         · YuNet 人脸检测 + SFace 人脸特征（cv2.FaceDetectorYN /
+#                           cv2.FaceRecognizerSF，需要 4.5.4+，这里按 4.7 起）
+#                         · 本机摄像头 / RTSP 流采集（cv2.VideoCapture）
+#                         · 浏览器摄像头推来的 JPEG 帧解码（cv2.imdecode）
+#                       注意：**不需要** opencv-contrib-python，这两个模型都在主包里。
 #   httpx               调用 Open-Meteo 取天气预报
 #   websockets          协议自检脚本用的 WebSocket 客户端
+#
+# 人脸模型（models/*.onnx）已随仓库提供；万一丢失，运行
+#   python scripts/fetch_models.py
+# 重新下载即可。
 #
 # 可选（只在跑 Home Assistant 桥接时才需要）：
 #   pip install paho-mqtt
@@ -18,5 +28,6 @@ fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
 numpy>=1.26
 pillow>=10.0
+opencv-python>=4.7
 httpx>=0.27
 websockets>=12.0

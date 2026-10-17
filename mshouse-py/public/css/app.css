@@ -21,6 +21,10 @@
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--font); }
 button, input, select { font-family: inherit; }
 button { cursor: pointer; }
+/* hidden 属性必须压过组件自己的 display 规则。
+   （`.setup label { display: grid }` 这类规则优先级高于浏览器默认的
+   `[hidden] { display: none }`，会让 hidden 元素照样显示出来。） */
+[hidden] { display: none !important; }
 /* canvas 是替换元素：只写 inset:0 不会拉伸，必须显式给宽高 */
 #viewport { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
 
@@ -196,7 +200,7 @@ select {
   border: 1px solid var(--line);
   aspect-ratio: 16 / 10;
 }
-.video-box canvas, .video-box img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.video-box canvas, .video-box img, .video-box video { width: 100%; height: 100%; display: block; object-fit: cover; }
 .video-box .tag {
   position: absolute;
   left: 8px; top: 8px;
@@ -310,11 +314,22 @@ select {
   padding: 0;
   background: var(--panel-solid);
   color: var(--ink);
-  width: min(440px, calc(100vw - 32px));
+  /* 设置项拆成「地点 / 摄像头 / 人脸锁」三张卡片后内容变宽了：
+     窄弹窗会把输入框和说明文字挤成一长条，所以直接给到 920px。
+     高度也放开（视口不够高时弹窗内部滚动，而不是把卡片压扁）。 */
+  width: min(920px, calc(100vw - 40px));
+  max-height: min(92vh, 980px);
   box-shadow: var(--shadow);
 }
 .setup::backdrop { background: rgba(6, 10, 9, 0.62); backdrop-filter: blur(6px); }
-.setup form { display: grid; gap: 12px; padding: 18px 18px 16px; }
+.setup form {
+  display: grid;
+  gap: 12px;
+  padding: 18px 18px 16px;
+  max-height: min(92vh, 980px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .setup h2 { margin: 0; font-size: 18px; }
 .setup header p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
 .setup label { display: grid; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -338,16 +353,83 @@ select {
   font-size: 13px;
 }
 .setup-sep { height: 1px; margin: 2px 0; background: var(--line); opacity: 0.7; }
+/* 卡片网格：地点 / 摄像头 并排，人脸锁（内容最多）跨两列铺满 */
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
 .setup-card {
   border: 1px solid var(--line);
   border-radius: 16px;
   padding: 12px 14px;
   display: grid;
   gap: 10px;
+  /* 卡片被同行的另一张拉高时，别把里面的行也拉开（否则输入框之间会浮出大片空白） */
+  align-content: start;
   background: rgba(255,255,255,0.02);
 }
+.setup-card-wide { grid-column: 1 / -1; }
 .setup-card h3 { margin: 0; font-size: 13px; color: var(--gold, #e2b15a); letter-spacing: .04em; }
 .setup footer { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* 窄屏：卡片改单列，弹窗退回近全屏 */
+@media (max-width: 780px) {
+  .setup { width: calc(100vw - 20px); max-height: 94vh; }
+  .setup form { max-height: 94vh; padding: 14px; }
+  .setup-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------------- 人脸锁卡片：登记库列表 ---------------- */
+.face-users {
+  display: grid;
+  gap: 6px;
+  max-height: 190px;
+  overflow-y: auto;
+}
+.face-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+  font-size: 13px;
+}
+.face-user-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.face-user-kind {
+  flex: none;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.face-user-kind.primary { color: #e2b15a; border-color: rgba(226,177,90,.5); }
+.face-user .mini { flex: none; padding: 4px 10px; font-size: 12px; }
+.face-users-empty {
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.face-enroll { display: grid; gap: 10px; }
+.face-enroll .row { justify-content: flex-start; }
+.mini.danger { color: #ffb4a8; border-color: rgba(224,122,95,.5); }
+.mini.danger:hover { background: rgba(224,122,95,.14); }
+/* 浏览器摄像头：预览区压缩一点，别把设置卡片撑得太高 */
+#setupLockBrowserWrap .video-box { aspect-ratio: 16 / 9; max-height: 190px; }
+#setupLockBrowserWrap .row { justify-content: flex-start; }
+#lockBrowserBox .mini.primary {
+  background: linear-gradient(180deg, rgba(226,177,90,.95), rgba(196,140,62,.92));
+  color: #1b1408;
+  border: 0;
+  font-weight: 700;
+}
 #setupAuthPane, #setupCardsPane { display: grid; gap: 12px; }
 #setupAuthPane[hidden], #setupCardsPane[hidden] { display: none; }
 #setupCardsPane { max-height: min(82vh, 720px); overflow-y: auto; }

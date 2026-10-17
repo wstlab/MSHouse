@@ -96,10 +96,99 @@ def norm3(v) -> tuple[float, float, float]:
 # ------------------------------------------------------------------ #
 # 客厅几何
 # ------------------------------------------------------------------ #
-@lru_cache(maxsize=8)
-def build_living_faces(night: bool, lamp_on: bool) -> tuple[Face, ...]:
-    """构建客厅所有面。结果按 (night, lamp_on) 缓存 —— 一帧几百个面对象，
-    每帧重建在 Python 里开销可观，而这两个入参只有 4 种组合。"""
+DOOR_X0, DOOR_X1, DOOR_H = -4.02, -2.78, 2.15
+
+
+def _door_faces(door_open: bool, night: bool) -> list[Face]:
+    """入户门。
+
+    监控画面里「门开没开」必须一眼可读，所以门不是一张贴在墙上的色块：
+      · 门洞后面画一层门外景象（开门时露出来）
+      · 门扇按合页角度真实旋转 —— 上锁时闭合，开锁后向室内旋开
+      · 门框侧面有一颗状态灯（红=锁闭、绿=开启）
+      · 开门时地面有一道门外光带
+    """
+    zf = Z1 - 0.05
+    out: list[Face] = []
+
+    # 门洞：开门时能看到门外。分「天空 / 地面」两段，比一整块纯色更像室外。
+    if night:
+        sky_out, ground_out = (14, 19, 30), (32, 38, 32)
+    else:
+        sky_out, ground_out = (170, 202, 216), (104, 124, 92)
+    out.append(quad([(DOOR_X0, 0.92, Z1 - 0.02), (DOOR_X1, 0.92, Z1 - 0.02),
+                     (DOOR_X1, DOOR_H, Z1 - 0.02), (DOOR_X0, DOOR_H, Z1 - 0.02)],
+                    (0, 0, -1), sky_out, order=L_FIX, flat=True))
+    out.append(quad([(DOOR_X0, 0, Z1 - 0.02), (DOOR_X1, 0, Z1 - 0.02),
+                     (DOOR_X1, 0.92, Z1 - 0.02), (DOOR_X0, 0.92, Z1 - 0.02)],
+                    (0, 0, -1), ground_out, order=L_FIX, flat=True))
+
+    # 门套与门槛
+    frame = C["frame"]
+    out += box_faces(DOOR_X0 - 0.08, DOOR_X0, 0, DOOR_H + 0.09, Z1 - 0.10, Z1 - 0.02, frame, order=L_FIX)
+    out += box_faces(DOOR_X1, DOOR_X1 + 0.08, 0, DOOR_H + 0.09, Z1 - 0.10, Z1 - 0.02, frame, order=L_FIX)
+    out += box_faces(DOOR_X0 - 0.08, DOOR_X1 + 0.08, DOOR_H, DOOR_H + 0.09, Z1 - 0.10, Z1 - 0.02, frame, order=L_FIX)
+    out += box_faces(DOOR_X0, DOOR_X1, 0, 0.045, Z1 - 0.16, Z1 - 0.02, (118, 108, 96), order=L_FIX)
+
+    if door_open:
+        # 门扇绕左合页向室内旋开 45°：角度太小像没开，太大又会被门框挡住看不见门板
+        a = math.radians(45)
+        ux, uz = math.cos(a), -math.sin(a)      # 沿门扇宽度方向
+        nx, nz = -uz, ux                        # 门扇法线（厚度方向）
+        t = 0.025
+        hx, hz = DOOR_X0 + 0.03, zf - 0.02
+        length = (DOOR_X1 - DOOR_X0) - 0.06
+
+        def leaf(s0: float, s1: float, y0: float, y1: float, off: float):
+            return [(hx + ux * s + nx * off, y, hz + uz * s + nz * off)
+                    for s, y in ((s0, y0), (s1, y0), (s1, y1), (s0, y1))]
+
+        # 两个大面（双面都画，避免转到背面时被剔除）+ 两块门芯
+        for sign in (1, -1):
+            out.append(quad(leaf(0, length, 0.03, DOOR_H - 0.03, t * sign),
+                            (nx * sign, 0, nz * sign), C["door"], order=L_FIX))
+            for y0, y1 in ((1.30, 1.94), (0.30, 1.14)):
+                out.append(quad(leaf(0.12, length - 0.12, y0, y1, (t + 0.004) * sign),
+                                (nx * sign, 0, nz * sign), (114, 79, 50), order=L_FIX, flat=True))
+        # 门扇端头的厚度面
+        ex, ez = hx + ux * length, hz + uz * length
+        out.append(quad([(ex + nx * t, 0.03, ez + nz * t), (ex - nx * t, 0.03, ez - nz * t),
+                         (ex - nx * t, DOOR_H - 0.03, ez - nz * t), (ex + nx * t, DOOR_H - 0.03, ez + nz * t)],
+                        (ux, 0, uz), (86, 60, 38), order=L_FIX))
+        # 门把手（落在门扇外侧）
+        hxp = hx + ux * (length - 0.12) - nx * 0.055
+        hzp = hz + uz * (length - 0.12) - nz * 0.055
+        out += box_faces(hxp - 0.035, hxp + 0.035, 0.98, 1.06, hzp - 0.035, hzp + 0.035,
+                         C["metal"], order=L_FIX)
+
+        # 门外光带落在地面上（半透明，不盖住地板纹理）
+        out.append(quad([(DOOR_X0, 0.058, zf - 0.02), (DOOR_X1, 0.058, zf - 0.02),
+                         (DOOR_X1 + 0.35, 0.058, 2.95), (DOOR_X0 - 0.35, 0.058, 2.95)],
+                        (0, 1, 0), (255, 226, 170) if not night else (120, 132, 150),
+                        order=L_FIX, alpha=0.3, flat=True))
+    else:
+        # 闭合门扇：两块凹陷门芯 + 把手
+        out += box_faces(DOOR_X0 + 0.02, DOOR_X1 - 0.02, 0.02, DOOR_H - 0.02,
+                         zf - 0.055, zf, C["door"], order=L_FIX)
+        for y0, y1 in ((1.28, 1.92), (0.28, 1.12)):
+            out.append(quad([(DOOR_X0 + 0.12, y0, zf - 0.06), (DOOR_X1 - 0.12, y0, zf - 0.06),
+                             (DOOR_X1 - 0.12, y1, zf - 0.06), (DOOR_X0 + 0.12, y1, zf - 0.06)],
+                            (0, 0, -1), (112, 78, 50), order=L_FIX, flat=True))
+        out += box_faces(DOOR_X1 - 0.20, DOOR_X1 - 0.12, 0.98, 1.06,
+                         zf - 0.09, zf - 0.055, C["metal"], order=L_FIX)
+
+    # 门框上的状态灯：红=锁闭，绿=已开
+    led = (125, 206, 160) if door_open else (239, 111, 108)
+    out.append(quad([(DOOR_X1 + 0.015, 0.94, Z1 - 0.105), (DOOR_X1 + 0.065, 0.94, Z1 - 0.105),
+                     (DOOR_X1 + 0.065, 0.99, Z1 - 0.105), (DOOR_X1 + 0.015, 0.99, Z1 - 0.105)],
+                    (0, 0, -1), led, order=L_FIX, flat=True))
+    return out
+
+
+@lru_cache(maxsize=16)
+def build_living_faces(night: bool, lamp_on: bool, door_open: bool = False) -> tuple[Face, ...]:
+    """构建客厅所有面。结果按 (night, lamp_on, door_open) 缓存 —— 一帧几百个面对象，
+    每帧重建在 Python 里开销可观，而这几个入参只有 8 种组合。"""
     faces: list[Face] = []
     sky = SKY_NIGHT if night else SKY_DAY
 
@@ -115,8 +204,7 @@ def build_living_faces(night: bool, lamp_on: bool) -> tuple[Face, ...]:
     # （略微内缩，避免与墙面同深度导致前后关系不确定）
     faces.append(quad([(-1.0, 0.95, Z1 - 0.04), (1.1, 0.95, Z1 - 0.04), (1.1, 2.35, Z1 - 0.04), (-1.0, 2.35, Z1 - 0.04)],
                       (0, 0, -1), sky, order=L_FIX, flat=True))
-    faces.append(quad([(-4.02, 0, Z1 - 0.05), (-2.78, 0, Z1 - 0.05), (-2.78, 2.15, Z1 - 0.05), (-4.02, 2.15, Z1 - 0.05)],
-                      (0, 0, -1), C["door"], order=L_FIX))
+    faces += _door_faces(door_open, night)
     faces.append(quad([(X0 + 0.04, 0.95, -2.1), (X0 + 0.04, 2.35, -2.1), (X0 + 0.04, 2.35, 0.5), (X0 + 0.04, 0.95, 0.5)],
                       (1, 0, 0), sky, order=L_FIX, flat=True))
     faces.append(quad([(X1 - 0.04, 0, -1.7), (X1 - 0.04, 0, -0.2), (X1 - 0.04, 2.2, -0.2), (X1 - 0.04, 2.2, -1.7)],
@@ -174,7 +262,8 @@ def living_lights(night: bool, lamp: dict) -> list[Light]:
 # OSD
 # ------------------------------------------------------------------ #
 def draw_osd(raster: Raster, *, label: str, pan: float, armed: bool, motion: bool,
-             live: bool, channel: str, fps: int, now: int, night: bool) -> None:
+             live: bool, channel: str, fps: int, now: int, night: bool,
+             door_open: bool = False) -> None:
     """顶部 / 底部 OSD 信息条。"""
     w, h = raster.width, raster.height
     ink = (243, 239, 230)
@@ -209,6 +298,15 @@ def draw_osd(raster: Raster, *, label: str, pan: float, armed: bool, motion: boo
     if live and int(now / 600) % 2 == 0:
         raster.fill_rect(w - 46, 30, 8, 8, (239, 111, 108))
         raster.text("REC", w - 34, 29, (239, 111, 108), 2)
+
+    # 入户门状态牌：客厅画面里「门开没开」必须一眼可读，云台转到哪都带着这块 OSD
+    door_text = "DOOR OPEN" if door_open else "DOOR LOCKED"
+    door_color = (239, 111, 108) if door_open else (125, 206, 160)
+    tw = Raster.text_width(door_text, 2)
+    tx, ty = 10, h - bar_h - 26
+    raster.fill_rect(tx, ty, tw + 16, 20, (0, 0, 0), 0.55)
+    raster.fill_rect(tx, ty, 4, 20, door_color, 0.95)
+    raster.text(door_text, tx + 9, ty + 4, door_color, 2)
 
     # 移动侦测告警框
     if motion:
@@ -254,7 +352,9 @@ class LivingRoomSource:
         cam = Camera(pos=CAM_POS, pan=pan, tilt=CAM_TILT, fov_y=FOV,
                      width=self.width, height=self.height, near=0.06)
         lamp_on = bool(lamp.get("on")) and float(lamp.get("brightness") or 0) > 0
-        faces = build_living_faces(night, lamp_on)
+        door = env.get("door") or {}
+        door_open = bool(door.get("open"))
+        faces = build_living_faces(night, lamp_on, door_open)
         lights = living_lights(night, lamp)
         # 环境项偏高：真实房间里墙面之间的漫反射会把垂直面也提亮，
         # 纯方向光会让墙和家具侧面全黑，反而不像监控画面。
@@ -263,7 +363,8 @@ class LivingRoomSource:
 
         draw_osd(raster, label=self.label, pan=pan, armed=bool(state.get("armed")),
                  motion=bool(state.get("motion")), live=bool(state.get("streaming")),
-                 channel=self.channel, fps=fps, now=now, night=night)
+                 channel=self.channel, fps=fps, now=now, night=night,
+                 door_open=door_open)
         return raster
 
 

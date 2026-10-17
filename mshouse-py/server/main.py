@@ -29,7 +29,9 @@ from fastapi.staticfiles import StaticFiles
 from . import security
 from .config import AppConfig, load_config
 from .gateway import AUTH_GRACE_SECONDS, Client, Gateway
+from .media import SOURCE_KINDS
 from .model import ERROR_CODES, FAULT_CODES, PROTOCOL_VERSION
+from .vision import DEFAULT_THRESHOLD
 
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / "public"
@@ -48,7 +50,7 @@ def _load_runtime_source() -> dict | None:
         return None
     try:
         data = json.loads(LOCK_SOURCE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("kind") in ("image", "camera", "stream"):
+        if isinstance(data, dict) and data.get("kind") in SOURCE_KINDS:
             return {
                 "kind": data["kind"],
                 "index": int(data.get("index", 0)),
@@ -80,7 +82,7 @@ def _build_lock_options(cfg: AppConfig) -> dict | None:
         },
         "face": {
             "photo": resolve(str(face.get("photo") or "") or None),
-            "threshold": face.get("threshold", 0.62),
+            "threshold": face.get("threshold", DEFAULT_THRESHOLD),
             # 运行时「登记新用户」的人脸裁剪图目录，文件名即用户名
             "enrollDir": str(ROOT / "camera" / "faces"),
         },
@@ -214,6 +216,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MSHouse Gateway", version=PROTOCOL_VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def revalidate_static(request: Request, call_next):
+    """HTML / JS / CSS 每次访问都回源校验（ETag 命中仍走 304）。
+
+    项目按用户要求去掉了 `?v=` 版本戳，静态资源就只能靠缓存头保证「改完刷新即生效」；
+    否则浏览器/CDN 会继续用旧脚本，出现「代码里明明加了新设备，页面上却没有」。
+    流通道（/?stream=…）是长连接，必须跳过。
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if not request.query_params.get("stream") and (
+        path == "/" or path.endswith((".html", ".js", ".css"))
+    ):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ------------------------------------------------------------------ #
@@ -403,6 +422,54 @@ async def upload_lock_face(request: Request):
 @app.delete("/api/lock/face")
 async def clear_lock_face():
     return JSONResponse(await gateway.clear_lock_face())
+
+
+# ------------------------------------------------------------------ #
+# 大门锁 · 人脸登记库（设置弹窗「人脸锁」卡片）
+#
+# 读接口开放（和 /health 里的 lock.face 同源，不含任何隐私内容）；
+# 写接口（登记 / 删除）要带设置口令 —— 它们是破坏性操作，而 HTTP 端点
+# 不像 WebSocket 那样有会话可挂鉴权，所以由前端把设置弹窗里已经验证过的
+# 口令放进 X-Setup-Password 请求头带过来。
+# ------------------------------------------------------------------ #
+@app.get("/api/lock/faces")
+async def list_lock_faces():
+    return JSONResponse(gateway.lock_faces())
+
+
+@app.post("/api/lock/enroll")
+async def enroll_lock_face(request: Request, name: str = ""):
+    if not gateway.verify_setup_password(request.headers.get("x-setup-password")):
+        return JSONResponse({"ok": False, "error": "初始化口令不正确"}, status_code=403)
+    data = await request.body()
+    result = await gateway.enroll_lock_face(name, data)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+@app.delete("/api/lock/enroll")
+async def remove_lock_face(request: Request, name: str = ""):
+    if not gateway.verify_setup_password(request.headers.get("x-setup-password")):
+        return JSONResponse({"ok": False, "error": "初始化口令不正确"}, status_code=403)
+    result = await gateway.remove_lock_face(name)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+# ------------------------------------------------------------------ #
+# 大门锁 · 浏览器摄像头推帧
+#
+# 浏览器端 getUserMedia 拿到画面 → 画到 canvas → toBlob('image/jpeg') → POST 到这里。
+# 为什么像素不走 WebSocket：本项目一贯的分工是「WebSocket 走控制与信令、
+# HTTP 走像素」（见 README 的并发模型一节）。摄像头的 MJPEG 也是这么出去的，
+# 推帧方向反过来而已 —— 保持一致，学生只需要理解一套模型。
+#
+# 为什么不做成服务端去拉浏览器：浏览器里的摄像头根本没有可访问的地址，
+# 服务端也没法反向连进浏览器，所以只能由浏览器主动推。
+# ------------------------------------------------------------------ #
+@app.post("/api/lock/frame")
+async def push_lock_frame(request: Request):
+    data = await request.body()
+    result = await gateway.push_browser_frame(data)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
 # ------------------------------------------------------------------ #

@@ -1,5 +1,5 @@
 """
-参数校验器（v2.0 新增）
+参数校验器
 
 为什么需要单独一个模块：
 早期版本的 _apply_patch 直接写 `int(clamp(float(patch["brightness"] or 0), 0, 100))`，

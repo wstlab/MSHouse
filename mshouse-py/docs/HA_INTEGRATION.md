@@ -73,7 +73,7 @@ python integrations/ha_bridge.py --mqtt-host 127.0.0.1
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--ws` | `ws://127.0.0.1:8080/ws` | MSHouse 网关地址 |
-| `--token` | 环境变量 `MSHOUSE_TOKEN` | **访问令牌（v2.0 起必需）**，通过子协议 `bearer.<token>` 携带 |
+| `--token` | 环境变量 `MSHOUSE_TOKEN` | **访问令牌（必需）**，通过子协议 `bearer.<token>` 携带 |
 | `--mqtt-host` / `--mqtt-port` | `127.0.0.1` / `1883` | Broker 地址 |
 | `--mqtt-username` / `--mqtt-password` | 空 | 需要认证时填 |
 | `--mqtt-tls` | 关 | 启用 TLS（自签证书不校验） |
@@ -100,7 +100,7 @@ mosquitto_sub -h 127.0.0.1 -t 'homeassistant/#' -v | head
 MSHouse 的 12 台设备会展开成 37 个 HA 实体，并且**按房间自动归入对应区域**
 （靠 Discovery 里的 `suggested_area` 字段，HA 会自动创建区域）。
 
-> **设备级可用性（v2.0 新增）**：每个实体的 `availability` 是一个**列表** ——
+> **设备级可用性**：每个实体的 `availability` 是一个**列表** ——
 > 既看桥接器本身（`mshouse/bridge/status`），也看**该设备**是否在线
 > （`mshouse/<设备>/availability`），`availability_mode: all`。
 > 这样某台设备掉线时，只有它的实体变灰，不会整片误报「不可用」。
@@ -128,7 +128,7 @@ MSHouse 的 12 台设备会展开成 37 个 HA 实体，并且**按房间自动�
 温湿度带 `device_class` 和 `state_class`，可以直接进 HA 的历史统计与长短期图表。
 电量与信号强度标为**诊断类**（`entity_category: diagnostic`）。
 
-> **为什么没有「舒适度」实体**：v1.0 输出过一个 `..._comfort` 文本实体，v2.0 已移除。
+> **为什么没有「舒适度」实体**：早期版本输出过一个 `..._comfort` 文本实体，现已移除。
 > 真实温湿度传感器（Zigbee `0x0402`、Matter `TemperatureMeasurement`）只上报物理量，
 > 不会在自己的属性里塞一个语义标签；而且旧的判据（`23~27 °C 且 40~60 %RH`）没有标准出处，
 > 把 30 °C/75 % 和 18 °C/75 % 压成同一个结论。要在 HA 里要这个语义，
@@ -300,7 +300,7 @@ automation:
 
 **Q：桥接器连不上，日志里出现 `4401` / `unauthorized`？**
 网关启用了鉴权。把启动日志里的访问令牌通过 `--token` 或环境变量 `MSHOUSE_TOKEN` 传给桥接器即可。
-如果日志里是 `4426` / `protocol mismatch`，说明桥接器与网关的协议主版本不一致，两边都要升到 v2.0。
+如果日志里是 `4426` / `protocol mismatch`，说明桥接器与网关的协议主版本不一致，两边要用同一主版本。
 
 **Q：实体没出现？**
 按顺序排查：① `mosquitto_sub -t 'homeassistant/#' -v` 能看到配置说明桥在正常工作；

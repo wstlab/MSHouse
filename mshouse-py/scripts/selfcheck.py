@@ -31,7 +31,7 @@ from server.model import DEVICE_CATALOG, envelope  # noqa: E402
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8080/ws"
 HTTP_BASE = WS_URL.replace("wss://", "https://").replace("ws://", "http://").rsplit("/ws", 1)[0]
 
-# v2.0 起网关要求令牌。自检脚本同样要走鉴权 —— 它本来就该是
+# 网关要求令牌。自检脚本同样要走鉴权 —— 它本来就该是
 # 「一个真实客户端长什么样」的样板，不该有后门。
 TOKEN = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("MSHOUSE_TOKEN", "")
 
@@ -157,7 +157,7 @@ async def main() -> int:
                 await ws.send(json.dumps(msg, ensure_ascii=False))
 
             # 客户端侧设备影子。
-            # v2.0 起服务端默认只推「变化的字段」（stateKind=delta/confirmed），
+            # 服务端默认只推「变化的字段」（stateKind=delta/confirmed），
             # 客户端必须自己维护一份影子并合并 —— 这正是真实 IoT 客户端的做法。
             # 这个字典同时也是给读者看的样板。
             shadow: dict[str, dict] = {}
@@ -200,7 +200,7 @@ async def main() -> int:
             scene_t = asyncio.create_task(bus.wait_for("scene"))
             await send(envelope("scene", {"sceneId": "sleep"}, id="cmd-scene"))
             scene_msg = await scene_t
-            # v2.0：场景不再广播全量快照（那是广播放大），只推变化的设备。
+            # 场景不再广播全量快照（那是广播放大），只推变化的设备。
             # 想对账就主动拉一次全量 —— 这也让客户端不必依赖「服务端会推全量」这个假设。
             snap_after_t = asyncio.create_task(bus.wait_for("snapshot"))
             await send(envelope("snapshot", {}, id="cmd-snap-after-scene"))
@@ -248,7 +248,7 @@ async def main() -> int:
             ok("模拟人脸动作已移除", ((await gone_face_t).get("payload") or {}).get("ok") is False)
 
             # 5. 云台控制
-            # v2.0 起云台是**渐进转动**的（按 45°/s 推进并上报中间角度），
+            # 云台是**渐进转动**的（按 45°/s 推进并上报中间角度），
             # 不再是瞬间跳到目标值 —— 所以这里要给它足够的转动时间。
             pan_t = asyncio.create_task(bus.wait_for(
                 "state", lambda m: (m.get("payload") or {}).get("deviceId") == "camera.living"
@@ -358,7 +358,7 @@ async def main() -> int:
                    outdoor.get("source") == "forecast" and isinstance(outdoor.get("temp"), (int, float))
                    and math.isfinite(outdoor.get("temp", float("nan"))))
 
-            # ============ v2.0 新增用例 ============
+            # ============ 参数校验 / 故障 / 变化上报等进阶用例 ============
 
             # 11. 参数校验：畸形参数必须被拒，且**不能**带走连接
             bad_param = asyncio.create_task(bus.wait_for("ack", lambda m: m.get("ref") == "cmd-badparam"))
@@ -425,13 +425,14 @@ async def main() -> int:
                 ok("state 报文携带出站序号 seq", False, "8 秒内未收到 state")
 
             # 16. 变化上报：静默窗口内不应出现持续洪泛
-            # 这是 v2.0 最核心的一处改造。旧版每 2 秒无条件广播全部传感器，
-            # 30 秒静默会产生约 60 条 state 报文、其中近三成是重复值。
+            # 传感器按「变化上报」（对齐 Zigbee 的 ReportableChange）。
+            # 若无条件按固定周期广播全部传感器，30 秒静默会产生约 60 条 state 报文，
+            # 其中近三成是重复值。
             before = bus.count("state")
             await asyncio.sleep(10.0)
             added = bus.count("state") - before
             ok("静默 10 秒的 state 报文数受控（变化上报生效）", added <= 6,
-               f"{added} 条（旧版约为 20 条）")
+               f"{added} 条（无条件广播约为 20 条）")
 
             # 收尾：恢复离家模式
             await send(envelope("scene", {"sceneId": "away"}, id="cmd-reset"))
@@ -439,7 +440,7 @@ async def main() -> int:
 
             # 17. 协议版本协商：主版本不一致必须被拒
             # 放在最后，因为服务端拒绝后会主动关闭这条连接。
-            await ws.send(json.dumps({"v": "1.0", "type": "ping", "id": "cmd-ver", "payload": {}}))
+            await ws.send(json.dumps({"v": "9.9", "type": "ping", "id": "cmd-ver", "payload": {}}))
             try:
                 ver = await bus.wait_for(
                     "error", lambda m: (m.get("payload") or {}).get("code") == "PROTOCOL_MISMATCH",

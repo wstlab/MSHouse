@@ -287,7 +287,7 @@
  * ========================================================================== */
 
 /** 协议版本。主版本与网关不一致会被拒绝（close 4426），见 docs/INTEGRATION.md 3.5 */
-const PROTOCOL_VERSION = "2.0";
+const PROTOCOL_VERSION = "1.0.0";
 
 /** 子协议名。浏览器的 WebSocket 构造函数没法自定义请求头，令牌只能搭子协议的车 */
 const WS_SUBPROTOCOL = "mshouse.v1";
@@ -337,7 +337,7 @@ class TwinClient {
     this.scene = null;
     this.site = null;
     this.outdoor = null;
-    this.faults = new Map();      // deviceId -> [故障对象]，v2.0 新增
+    this.faults = new Map();      // deviceId -> [故障对象]
     this.seq = 0;                 // 已收到的最大出站序号，用于发现丢包
     this.dropped = 0;             // 本地统计的跳号次数
     this._manual = true;          // 默认不连接：必须显式调用 connect()
@@ -500,7 +500,7 @@ class TwinClient {
  * ========================================================================== */
 
 const $ = (s) => document.querySelector(s);
-const TYPE_LABEL = { light: "智能灯", sensor: "温湿度", ac: "空调", camera: "摄像头", lock: "人脸锁" };
+const TYPE_LABEL = { light: "智能灯", sensor: "温湿度", ac: "空调", camera: "摄像头", lock: "人脸锁", curtain: "电动窗帘" };
 const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bath: "卫生间", entry: "门厅" };
 const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
 const FAN_LABEL = { low: "低风", mid: "中风", high: "高风", auto: "自动" };
@@ -521,6 +521,7 @@ const ROLE = {
   lock: { sense: true, act: true },
   light: { sense: false, act: true },
   ac: { sense: false, act: true },
+  curtain: { sense: false, act: true },
 };
 const isSense = (d) => !!ROLE[d.type]?.sense;
 const isAct = (d) => !!ROLE[d.type]?.act;
@@ -618,7 +619,7 @@ const streamState = new Map();
 let streamCards = new Map();          // deviceId -> paint()
 
 /** 通道播放地址：/?stream=<通道名>，与 WebSocket 地址同一个主机。
- *  v2.0 起像素通道也要鉴权，而 <img> 带不了请求头 —— 把令牌拼在查询串上。 */
+ *  像素通道也要鉴权，而 <img> 带不了请求头 —— 把令牌拼在查询串上。 */
 function streamUrl(channel) {
   const base = client.url ? toHttpBase(client.url) : null;
   if (!base || !channel) return "";
@@ -792,6 +793,10 @@ function stateSummary(d) {
       return `${s.streaming ? "推流中" : "待机"} · 云台 ${Math.round(s.pan ?? 0)}° · ${s.armed ? "布防" : "撤防"}`;
     case "lock":
       return `${s.locked ? "已上锁" : "已开锁"} · 电量 ${s.battery ?? "--"}%${s.lastPerson ? " · " + s.lastPerson : ""}`;
+    case "curtain": {
+      const p = Math.round(s.position ?? 100);
+      return `${p >= 100 ? "全开" : p <= 0 ? "全闭" : `开度 ${p}%`} · ${p >= 100 ? "采光" : p <= 0 ? "遮光" : "半遮光"}`;
+    }
     default:
       return "";
   }
@@ -811,6 +816,9 @@ function sampleFor(d) {
       return s.streaming ? cmd("stream", { on: false }) : cmd("stream", { on: true });
     case "lock":
       return s.locked ? cmd("unlock", {}) : cmd("lock", {});
+    case "curtain":
+      // 样例直接做「全开 ↔ 全闭」的切换，方便演示 position 百分比
+      return cmd("set", { position: (s.position ?? 100) > 0 ? 0 : 100 });
     default:
       return cmd("set", {});
   }

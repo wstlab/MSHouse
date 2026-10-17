@@ -90,7 +90,7 @@ GW_DEVICE = {
     "identifiers": ["mshouse_gateway"],
     "name": "MSHouse 网关",
     "manufacturer": "Mirror Space",
-    "model": "MSHouse Gateway v2.0",
+    "model": "MSHouse Gateway v1.0.0",
 }
 
 
@@ -177,7 +177,7 @@ def _render_sensor(s: dict[str, Any]) -> dict[str, Any]:
     """
     传感器状态渲染。
 
-    v2.0 起不再输出 comfort：那是应用层派生量，真实温湿度传感器
+    不再输出 comfort：那是应用层派生量，真实温湿度传感器
     （Zigbee 0x0402 / Matter TemperatureMeasurement）只上报物理量。
     把它当设备原生属性发布到 HA，会让人误以为「这传感器能测舒适度」。
     需要舒适度请用 HA 自己的 template sensor，或读网关的 derived 字段。
@@ -607,7 +607,7 @@ class HaBridge:
         publish_min_interval: float = 1.0,
     ) -> None:
         self.ws_url = ws_url
-        # v2.0 起网关要求令牌；桥接器作为「客户端」同样要出示凭据
+        # 网关要求令牌；桥接器作为「客户端」同样要出示凭据
         self.token = token or os.environ.get("MSHOUSE_TOKEN") or ""
         self.prefix = prefix
         self.discovery_prefix = discovery_prefix
@@ -718,7 +718,7 @@ class HaBridge:
     def _envelope(self, type_: str, payload: Any) -> dict[str, Any]:
         self._seq += 1
         # v 必须与网关主版本一致，否则会被以 PROTOCOL_MISMATCH 拒绝（close 4426）
-        return {"v": "2.0", "type": type_, "id": f"ha-{self._seq}", "payload": payload}
+        return {"v": "1.0.0", "type": type_, "id": f"ha-{self._seq}", "payload": payload}
 
     async def _ws_send(self, msg: dict[str, Any]) -> None:
         ws = self._ws
@@ -836,7 +836,7 @@ class HaBridge:
             dev = {"id": dev_id, "type": payload.get("type"), "state": {}}
             self.devices[dev_id] = dev
         if isinstance(payload.get("state"), dict):
-            # v2.0 起网关默认只推「变化的字段」（stateKind=delta/confirmed），
+            # 网关默认只推「变化的字段」（stateKind=delta/confirmed），
             # 只有 full 是完整快照。这里必须区别对待：
             # 把增量当全量用，会把这次没变的字段全部抹掉。
             kind = payload.get("stateKind") or "full"
@@ -1015,7 +1015,7 @@ def main() -> int:
     ap.add_argument("--ws", default=os.environ.get("MSHOUSE_WS", "ws://127.0.0.1:8080/ws"),
                     help="MSHouse 网关 WebSocket 地址")
     ap.add_argument("--token", default=os.environ.get("MSHOUSE_TOKEN"),
-                    help="访问令牌（v2.0 起网关要求；也可用环境变量 MSHOUSE_TOKEN）")
+                    help="访问令牌（网关要求；也可用环境变量 MSHOUSE_TOKEN）")
     ap.add_argument("--mqtt-host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
     ap.add_argument("--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT", "1883")))
     ap.add_argument("--mqtt-username", default=os.environ.get("MQTT_USERNAME"))

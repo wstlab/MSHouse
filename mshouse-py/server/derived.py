@@ -1,5 +1,5 @@
 """
-派生量计算（v2.0 新增）
+派生量计算
 
 为什么要把「舒适」从设备状态里拿出来：
 早期版本把 comfort 直接写进 sensor 的 state，和 temperature / humidity 并列。

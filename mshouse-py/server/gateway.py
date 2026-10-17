@@ -35,7 +35,7 @@ import httpx
 from PIL import Image
 
 from . import derived, security, validate
-from .media import VideoSource
+from .media import SOURCE_KINDS, BrowserSource, make_source
 from .model import (
     BATTERY,
     DEVICE_CATALOG,
@@ -64,7 +64,7 @@ from .model import (
 )
 from .render.scenes import EntrySource, LivingRoomSource, StandbySource, _cover_crop
 from .stream import StreamHub
-from .vision import FaceMatcher
+from .vision import DEFAULT_THRESHOLD, FaceMatcher
 
 # 内置识别通过时显示的人名（与登记照片 camera/face.jpg 对应）
 LOCK_RESIDENT_NAME = "登记住户"
@@ -184,7 +184,7 @@ class Device:
     floor: int
     capabilities: tuple[str, ...]
     channel: str | None
-    # reported：设备实际上报的状态（真实值）。v2.0 起改名为 reported，
+    # reported：设备实际上报的状态（真实值）。
     # 因为「设备当前是什么状态」与「我们希望它是什么状态」是两件事，
     # 混用一个 state 字段就没法表达「命令已下发、设备还没执行完」。
     reported: dict[str, Any] = field(default_factory=dict)
@@ -215,7 +215,7 @@ class Device:
         """
         兼容别名。
 
-        v2.0 起 state 的正式名称是 reported。保留这个 property 是为了让
+        state 的正式名称是 reported。保留这个 property 是为了让
         渲染层、流信令等大量既有调用点不用全改，同时语义上明确
         「读到的是设备上报值」。新代码请直接写 reported。
         """
@@ -361,7 +361,7 @@ class Gateway:
                  security_config: Any = None,
                  device_config: Any = None) -> None:
         self.clients: set[Client] = set()
-        # —— 鉴权与仿真配置（v2.0）——
+        # —— 鉴权与仿真配置 ——
         self.security_config = security_config
         self.device_config = device_config
         self.token: str = str(getattr(security_config, "token", "") or "")
@@ -420,7 +420,7 @@ class Gateway:
         # 场景 key（sunny/rain/.../night）→ 画面文件绝对路径
         self.lock_scenes: dict[str, str] = dict(lock_options.get("scenes") or {})
         source_cfg = lock_options.get("source") or {}
-        self.video_source = VideoSource(
+        self.video_source = make_source(
             kind=str(source_cfg.get("kind") or "image"),
             index=int(source_cfg.get("index") or 0),
             url=str(source_cfg.get("url") or ""),
@@ -428,7 +428,7 @@ class Gateway:
         )
         face_cfg = lock_options.get("face") or {}
         self.face_matcher = FaceMatcher(
-            face_cfg.get("photo"), float(face_cfg.get("threshold") or 0.62),
+            face_cfg.get("photo"), float(face_cfg.get("threshold") or DEFAULT_THRESHOLD),
             enroll_dir=face_cfg.get("enrollDir"), primary_name=LOCK_RESIDENT_NAME,
         )
         # 陌生人脸「是否登记用户」提示状态机：
@@ -453,7 +453,7 @@ class Gateway:
 
     async def start(self) -> None:
         """启动周期任务。必须在事件循环里调用。"""
-        self._http = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "mshouse/2.0 (teaching)"})
+        self._http = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "mshouse/1.0.0 (teaching)"})
         self._restore_state()
         self._apply_simulated_conditions()
         self._tasks.append(asyncio.create_task(self._loop_telemetry()))
@@ -461,7 +461,9 @@ class Gateway:
         self._tasks.append(asyncio.create_task(self._loop_lock_vision()))
         self._tasks.append(asyncio.create_task(self._loop_heartbeat()))
         self._tasks.append(asyncio.create_task(self._loop_persistence()))
-        print(f"[lock] 人脸模型：{self.face_matcher.reason}，阈值 {self.face_matcher.threshold}")
+        print(f"[lock] 人脸模型：{self.face_matcher.backend}")
+        print(f"[lock] 登记库：{self.face_matcher.reason}，阈值 {self.face_matcher.threshold}"
+              f"（距离 = 1 − 余弦相似度）")
 
     async def dispose(self) -> None:
         self._save_state()
@@ -588,6 +590,7 @@ class Gateway:
         def cam_context() -> dict[str, Any]:
             c = self.devices.get("camera.living")
             lamp = self.devices.get("light.living")
+            door = self.devices.get("lock.entry")
             hour = time.localtime().tm_hour
             return {
                 "state": c.state if c else {},
@@ -602,6 +605,14 @@ class Gateway:
                             "colorTemp": lamp.state["colorTemp"],
                         }
                         if lamp else {"on": False, "brightness": 0, "colorTemp": 4000}
+                    ),
+                    # 客厅画面要能看出入户门开没开：门锁一开锁，门扇就在画面里转开
+                    "door": (
+                        {
+                            "open": not door.state.get("locked", True),
+                            "locked": bool(door.state.get("locked", True)),
+                        }
+                        if door else {"open": False, "locked": True}
                     ),
                 },
             }
@@ -710,7 +721,7 @@ class Gateway:
         if spec.type == "light":
             return {"power": False, "brightness": 0, "colorTemp": 4000}
         if spec.type == "sensor":
-            # v2.0：不再有 comfort 字段 —— 那是应用层派生量，已移到 derived 命名空间。
+            # 不再有 comfort 字段 —— 那是应用层派生量，已移到 derived 命名空间。
             # battery / rssi 是真实无线传感器必然会上报的器件状态。
             return {
                 "temperature": 26.8 if spec.room == "kitchen" else 25.2,
@@ -727,6 +738,9 @@ class Gateway:
             # facePresent：镜头前是否有人脸画面（由上传接口驱动，画面从草坪道路切到人脸）
             return {"locked": True, "lastPerson": None, "lastResult": "idle",
                     "streaming": False, "battery": 86, "facePresent": False, "rssi": -61}
+        if spec.type == "curtain":
+            # position = 开度百分比：0 完全闭合（遮光），100 完全拉开
+            return {"position": 100}
         return {}
 
     # ---------------- 连接管理 ----------------
@@ -1225,6 +1239,9 @@ class Gateway:
                                  f"{device.name} 拒绝了 {len(errors)} 个字段", errors)
             if not cleaned:
                 return self._err(ERROR_CODES.INVALID_PARAM, "没有需要写入的字段")
+            if device.type == "curtain" and "position" in cleaned:
+                return {"ok": True, "patch": cleaned,
+                        "event": self._curtain_event(device, int(cleaned["position"]))}
             return {"ok": True, "patch": cleaned}
 
         if device.type == "light":
@@ -1273,6 +1290,21 @@ class Gateway:
             if action == "stream":
                 return {"ok": True, "patch": {"streaming": params.get("on") is not False}}
 
+        elif device.type == "curtain":
+            if "switch" not in spec.capabilities:
+                return self._err(ERROR_CODES.UNSUPPORTED_CAPABILITY, "该窗帘不支持开合")
+            cur = int(s.get("position") or 0)
+            if action == "toggle":
+                target = 0 if cur > 50 else 100
+                return {"ok": True, "patch": {"position": target},
+                        "event": self._curtain_event(device, target)}
+            if action == "open":
+                return {"ok": True, "patch": {"position": 100},
+                        "event": self._curtain_event(device, 100)}
+            if action == "close":
+                return {"ok": True, "patch": {"position": 0},
+                        "event": self._curtain_event(device, 0)}
+
         elif device.type == "lock":
             if action == "lock":
                 return self._lock(device, True, params)
@@ -1293,6 +1325,17 @@ class Gateway:
 
         return self._err(ERROR_CODES.ACTION_NOT_SUPPORTED,
                          f"动作 {action} 不适用于 {device.type}")
+
+    @staticmethod
+    def _curtain_event(device: Device, position: int) -> dict[str, Any]:
+        """窗帘的语义事件：说清「开到多少」，而不是「N 个字段生效」。"""
+        if position >= 100:
+            text = "已完全拉开"
+        elif position <= 0:
+            text = "已完全闭合"
+        else:
+            text = f"开度已调整为 {position}%"
+        return {"level": "info", "source": device.id, "message": f"{device.name} {text}"}
 
     def _apply_patch(self, device: Device, patch: dict) -> dict[str, Any]:
         """
@@ -1483,6 +1526,11 @@ class Gateway:
         )
         if not context_ok:
             self._stop_vision_episode("stop")
+            # 实时识别上下文失效（停推流 / 门已开 / 切回静态图）时，把上一帧的
+            # 识别结论一起清掉 —— 否则 OSD 会一直挂着一个过期的人脸框，
+            # 看起来像「还在识别」。上传人脸画面模式（lock_face 不为空）不走这里。
+            if self.lock_face is None and self._last_vision.get("detected"):
+                self._last_vision = {"detected": False, "box": None, "distance": None}
             return
         frame = self.video_source.latest()
         if frame is None:
@@ -1624,26 +1672,84 @@ class Gateway:
             "phase": phase,
             "grade": {"add": round(add, 2)},
             "source": self.video_source.status().as_dict(),
-            "face": {
-                "ready": self.face_matcher.ready,
-                "reason": self.face_matcher.reason,
-                "threshold": self.face_matcher.threshold,
-                "users": self.face_matcher.users(),
-            },
+            "face": self.lock_faces(),
             "enroll": self._enroll_prompt_payload("ask") if self._enroll_prompt else None,
         }
+
+    # ---------------- 人脸登记库管理（设置弹窗「人脸锁」卡片） ----------------
+
+    def lock_faces(self) -> dict[str, Any]:
+        """人脸登记库现状：模型、阈值、已登记用户清单。"""
+        return {
+            "ready": self.face_matcher.ready,
+            "reason": self.face_matcher.reason,
+            "backend": self.face_matcher.backend,
+            "threshold": self.face_matcher.threshold,
+            "users": self.face_matcher.users(),
+            "enrolled": self.face_matcher.list_users(),
+        }
+
+    async def enroll_lock_face(self, name: Any, data: bytes) -> dict[str, Any]:
+        """登记新用户：上传的照片 → YuNet 检测对齐 → 特征入库。
+
+        注意解码方式和「上传人脸画面」不同 —— 那条路径会把图 cover 裁剪成
+        通道分辨率（512×320），登记照这么裁很容易把脸切掉，所以这里只转正、
+        不裁剪（见 _decode_enroll_image）。
+        """
+        if not data:
+            return {"ok": False, "error": "没有收到图片数据"}
+        if len(data) > MAX_FACE_BYTES:
+            return {"ok": False, "error": f"图片过大（上限 {MAX_FACE_BYTES // 1024 // 1024}MB）"}
+        try:
+            img = await asyncio.to_thread(_decode_enroll_image, data)
+        except Exception as err:
+            return {"ok": False, "error": f"无法识别的图片文件：{err}"}
+
+        ok, reason, final_name = await asyncio.to_thread(
+            self.face_matcher.enroll, str(name or ""), img)
+        if not ok:
+            return {"ok": False, "error": reason}
+
+        self.broadcast_event({
+            "level": "ok", "source": "lock.entry",
+            "message": f"已登记人脸用户「{final_name}」（共 {len(self.face_matcher.users())} 人）",
+        })
+        return {"ok": True, "name": final_name, "message": reason, **self.lock_faces()}
+
+    async def remove_lock_face(self, name: Any) -> dict[str, Any]:
+        """删除一个登记用户（含磁盘上的人脸图）。"""
+        wanted = str(name or "").strip()
+        ok, reason = await asyncio.to_thread(self.face_matcher.remove, wanted)
+        if not ok:
+            return {"ok": False, "error": reason}
+        self.broadcast_event({
+            "level": "warn", "source": "lock.entry",
+            "message": f"已删除人脸登记用户「{wanted}」",
+        })
+        return {"ok": True, "message": reason, **self.lock_faces()}
+
+    def verify_setup_password(self, value: Any) -> bool:
+        """给 HTTP 端点复用口令校验。
+
+        登记 / 删除人脸是破坏性操作，而 HTTP 端点不像 WebSocket 那样有会话，
+        所以由前端把设置弹窗里已验证过的口令放进请求头带过来。
+        """
+        return self._check_setup_password(value)
 
     # ---------------- 画面来源运行时切换（初始化弹窗） ----------------
 
     def apply_lock_source(self, kind: Any, index: Any = 0, url: Any = "") -> tuple[bool, str | None]:
-        """切换大门锁画面来源：image / camera / stream。
+        """切换大门锁画面来源：image / camera / stream / browser。
 
         立即生效（推流中会自动打开或释放设备），并持久化到 sidecar JSON，
         下次启动覆盖 config.toml 里的静态配置。
+
+        browser（浏览器摄像头）是个特例：服务端没有设备可开，它只是把
+        VideoSource 换成 BrowserSource，等浏览器把帧 POST 到 /api/lock/frame。
         """
         kind = str(kind or "image").strip().lower()
-        if kind not in ("image", "camera", "stream"):
-            return False, "画面来源只能是 image / camera / stream"
+        if kind not in SOURCE_KINDS:
+            return False, "画面来源只能是 " + " / ".join(SOURCE_KINDS)
         try:
             index_int = int(index)
         except (TypeError, ValueError):
@@ -1661,7 +1767,7 @@ class Gateway:
         streaming = bool(device is not None and device.state.get("streaming"))
         old = self.video_source
         old.close(timeout=0.0)  # 不阻塞 WS 处理；旧采集线程守护退出
-        self.video_source = VideoSource(
+        self.video_source = make_source(
             kind=kind, index=index_int, url=url_str,
             width=STREAM_WIDTH, height=STREAM_HEIGHT,
         )
@@ -1677,12 +1783,51 @@ class Gateway:
             self.hub.kick(device.channel)
             self._signal_stream(device, "lock")
         self.broadcast_snapshot()
-        names = {"image": "静态天气画面", "camera": f"本机摄像头 #{index_int}", "stream": "网络视频流"}
+        names = {
+            "image": "静态天气画面",
+            "camera": f"本机摄像头 #{index_int}",
+            "stream": "网络视频流",
+            "browser": "浏览器摄像头",
+        }
         self.broadcast_event({
             "level": "info", "source": "lock.entry",
-            "message": f"大门锁画面来源已切换为：{names[kind]}",
+            "message": f"大门锁画面来源已切换为：{names[kind]}"
+                       + ("（请打开摄像头并点「推送画面」）" if kind == "browser" else ""),
         })
         return True, None
+
+    # ---------------- 浏览器摄像头：接收前端推来的帧 ----------------
+
+    async def push_browser_frame(self, data: bytes) -> dict[str, Any]:
+        """收下浏览器推来的一帧画面。
+
+        像素刻意走 HTTP 而不是 WebSocket —— 与项目一贯的分工一致：
+        WebSocket 只走控制与信令，像素走 HTTP。前端把 getUserMedia 的画面
+        画到 canvas 上编码成 JPEG 再 POST 过来，网关只负责收帧和识别。
+
+        识别策略：**不做逐帧识别**（前端 2fps 推帧，逐帧跑模型纯属浪费），
+        只负责把帧交给 video_source；真正的人脸识别仍由 _loop_lock_vision
+        每秒一次统一驱动，两条路径共用同一份 _last_vision 状态。
+        """
+        if not isinstance(self.video_source, BrowserSource):
+            return {"ok": False, "error": "当前画面来源不是「浏览器摄像头」，"
+                                          "请在「设置 → 画面来源」里切换"}
+        ok, message = await asyncio.to_thread(self.video_source.push, data)
+        if not ok:
+            return {"ok": False, "error": message}
+        status = self.video_source.status()
+        # 首帧到达 / 断流恢复：让画面面板与流信令立刻反映「已连接」
+        if status.frame_count == 1:
+            device = self.devices.get("lock.entry")
+            if device is not None:
+                if device.channel:
+                    self.hub.kick(device.channel)
+                self._signal_stream(device, "lock")
+        return {
+            "ok": True,
+            "frames": status.frame_count,
+            "connected": status.opened,
+        }
 
     def _persist_lock_source(self, kind: str, index: int, url: str) -> bool:
         if not self.lock_source_file:
@@ -1752,7 +1897,7 @@ class Gateway:
         校验初始化口令。
 
         只比对哈希，且用常数时间比较。口令明文不落任何文件、
-        也不进前端资源 —— 这是 v2.0 相对 1.0 最要紧的一处修正。
+        也不进前端资源。
         """
         return security.verify_password(str(value or ""), self.setup_password_hash)
 
@@ -1933,6 +2078,7 @@ class Gateway:
             set_state("ac.bedroom", {"power": False})
             set_state("camera.living", {"power": True, "armed": False, "pan": 20})
             set_state("lock.entry", {"locked": False})
+            set_state("curtain.bedroom", {"position": 100})
         elif scene_id == "away":
             self.occupancy = "away"
             for did in ("light.living", "light.kitchen", "light.bedroom", "light.bath"):
@@ -1941,6 +2087,7 @@ class Gateway:
             set_state("ac.bedroom", {"power": False})
             set_state("camera.living", {"power": True, "armed": True, "pan": 0})
             set_state("lock.entry", {"locked": True})
+            set_state("curtain.bedroom", {"position": 0})   # 离家闭合：遮阳节能，也避免外人看到室内
         elif scene_id == "sleep":
             self.occupancy = "sleep"
             set_state("light.living", {"power": False})
@@ -1951,6 +2098,7 @@ class Gateway:
             set_state("ac.bedroom", {"power": True, "mode": "cool", "targetTemp": 26, "fan": "low"})
             set_state("camera.living", {"power": True, "armed": True, "pan": 180})
             set_state("lock.entry", {"locked": True})
+            set_state("curtain.bedroom", {"position": 0})   # 睡眠闭合：遮光
         elif scene_id == "movie":
             self.occupancy = "home"
             set_state("light.living", {"power": True, "brightness": 12, "colorTemp": 2700})
@@ -1959,6 +2107,7 @@ class Gateway:
             set_state("light.bath", {"power": False})
             set_state("ac.living", {"power": True, "mode": "cool", "targetTemp": 24, "fan": "low"})
             set_state("camera.living", {"power": True, "armed": False})
+            set_state("curtain.bedroom", {"position": 0})   # 观影时卧室保持遮光
 
         # 场景只管设备开关与云台位置，不碰推流状态：流是独立会话，由 stream 指令控制
         for d in self.devices.values():
@@ -2538,6 +2687,35 @@ def _decode_face_image(data: bytes) -> Image.Image:
     if w < 64 or h < 64:
         raise ValueError("图片最短边不足 64px")
     return _cover_crop(img, STREAM_WIDTH, STREAM_HEIGHT)
+
+
+ENROLL_MAX_SIDE = 1600   # 登记照长边上限：够 YuNet 检出小脸，又不至于让推理变慢
+
+
+def _decode_enroll_image(data: bytes) -> Image.Image:
+    """登记照片解码：转正 + 限制长边，**不做 cover 裁剪**。
+
+    和 _decode_face_image（上传人脸画面用）的区别就在这里：那条路径要把图
+    裁成通道分辨率 512×320 去喂画面渲染，登记照要是也这么裁，构图稍偏就会
+    把脸切掉一半，白白登记失败。
+    """
+    img = Image.open(io.BytesIO(data))
+    img.load()
+    # EXIF 方向：手机拍的照片常带旋转标记，不转正人脸会横着躺
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    w, h = img.size
+    if min(w, h) < 64:
+        raise ValueError("图片最短边不足 64px")
+    if max(w, h) > ENROLL_MAX_SIDE:
+        scale = ENROLL_MAX_SIDE / max(w, h)
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                         Image.Resampling.LANCZOS)
+    return img
 
 
 def json_dumps(obj: Any) -> str:

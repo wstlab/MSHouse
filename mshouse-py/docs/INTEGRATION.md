@@ -33,7 +33,7 @@ MSHouse 镜像家居 · 网关已启动
 > 后端是 Python（FastAPI + asyncio），前端是 Three.js —— 两层通过标准协议对话，
 > 所以本指南里的客户端代码与后端语言无关。
 >
-> **v2.0 起 `/ws` 需要鉴权**：连不上、报 `4401` 基本都是没带令牌。
+> **`/ws` 需要鉴权**：连不上、报 `4401` 基本都是没带令牌。
 > 三种携带方式见 3.1。
 
 **第 2 步：打开 demo 客户端**
@@ -85,14 +85,14 @@ http://localhost:8080/demo.html?server=192.168.1.20:8080&token=<令牌>
 `demo.html` 里的 `TwinClient` 类是完整实现。如果你只想在浏览器控制台里试试，这些就够了：
 
 ```js
-// 令牌是 v2.0 起唯一必需的「额外一步」：浏览器只能通过子协议携带它
+// 令牌是唯一必需的「额外一步」：浏览器只能通过子协议携带它
 const token = localStorage.getItem("mshouse.token") || prompt("访问令牌（见网关启动日志）");
 const ws = new WebSocket("ws://localhost:8080/ws", ["mshouse.v1", `bearer.${token}`]);
 
 ws.onopen = () => {
   // 控制状态：打开客厅灯，亮度 60%
   ws.send(JSON.stringify({
-    v: "2.0", type: "command", id: "c-1", ts: Date.now(),
+    v: "1.0.0", type: "command", id: "c-1", ts: Date.now(),
     payload: { deviceId: "light.living", action: "set", params: { power: true, brightness: 60 } },
   }));
 };
@@ -103,7 +103,7 @@ ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   // 服务端心跳必须回，否则 3 次未回应会被以 4408 断开
   if (msg.type === "ping") {
-    ws.send(JSON.stringify({ v: "2.0", type: "pong", ts: Date.now(), payload: {} }));
+    ws.send(JSON.stringify({ v: "1.0.0", type: "pong", ts: Date.now(), payload: {} }));
     return;
   }
   // 认证后服务端主动推 hello + snapshot（全量影子），之后是增量 state
@@ -140,7 +140,7 @@ async def main():
         subprotocols=["mshouse.v1", f"bearer.{token}"],   # 令牌搭子协议的车
     ) as ws:
         await ws.send(json.dumps({
-            "v": "2.0", "type": "command", "id": "c-1",
+            "v": "1.0.0", "type": "command", "id": "c-1",
             "payload": {"deviceId": "light.living", "action": "set",
                         "params": {"power": True, "brightness": 60}},
         }))
@@ -148,7 +148,7 @@ async def main():
         async for raw in ws:
             msg = json.loads(raw)
             if msg["type"] == "ping":
-                await ws.send(json.dumps({"v": "2.0", "type": "pong", "payload": {}}))
+                await ws.send(json.dumps({"v": "1.0.0", "type": "pong", "payload": {}}))
             elif msg["type"] == "snapshot":
                 for d in msg["payload"]["devices"]:
                     shadow[d["id"]] = dict(d["state"])
@@ -174,7 +174,7 @@ asyncio.run(main())
 | 端点 | `ws://<host>:<port>/ws`（HTTPS 页面下用 `wss://`） |
 | 子协议 | `mshouse.v1`（服务端会回显） |
 | 鉴权 | **必需**，通过子协议头 / 查询串 / 首帧 hello 三选一携带令牌 |
-| 协议版本 | `2.0`（`v` 的主版本不一致会被拒绝） |
+| 协议版本 | `1.0.0`（`v` 的主版本不一致会被拒绝） |
 | 编码 | UTF-8 JSON 文本帧 |
 
 ### 3.1 令牌怎么带
@@ -197,7 +197,7 @@ websocat "ws://127.0.0.1:8080/ws?token=<令牌>"
 **③ 首帧 hello（某些 SDK 只能连上之后才发得出数据）**
 
 ```json
-{ "v": "2.0", "type": "hello", "payload": { "token": "<令牌>" } }
+{ "v": "1.0.0", "type": "hello", "payload": { "token": "<令牌>" } }
 ```
 
 > **令牌从哪来**：网关启动日志会打印。首次启动自动生成，抄进 `config.toml` 的
@@ -211,12 +211,12 @@ websocat "ws://127.0.0.1:8080/ws?token=<令牌>"
 认证通过后，服务端依次推三条：
 
 1. `hello` — 网关标识、协议版本、是否需要认证
-2. `snapshot` — **全量**设备影子（12 台设备 + 场景定义 + 最近事件 + 站点/室外信息）
+2. `snapshot` — **全量**设备影子（13 台设备 + 场景定义 + 最近事件 + 站点/室外信息）
 3. `event` — 一条 info 级接入事件
 
 未认证时只收到 `hello`，且 `payload.authed` 为 `false`。
 设备影子包含「家里有没有人」「门锁着没有」这类信息，不该让一个还没出示
-令牌的连接读到 —— 这也是 v2.0 把全量下发挪到认证之后的原因。
+令牌的连接读到 —— 这也是把全量下发挪到认证之后的原因。
 
 ### 3.3 心跳与断线判定
 
@@ -226,7 +226,7 @@ websocat "ws://127.0.0.1:8080/ws?token=<令牌>"
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   if (msg.type === "ping") {
-    ws.send(JSON.stringify({ v: "2.0", type: "pong", payload: {} }));
+    ws.send(JSON.stringify({ v: "1.0.0", type: "pong", payload: {} }));
   }
 };
 ```
@@ -240,7 +240,7 @@ ws.onmessage = (e) => {
 丢失（服务端在背压时会合并或丢弃），此时请求全量对齐：
 
 ```json
-{ "v": "2.0", "type": "resync", "payload": { "since": 128 } }
+{ "v": "1.0.0", "type": "resync", "payload": { "since": 128 } }
 ```
 
 服务端会回一份完整 `snapshot`，并带上 `currentSeq`。
@@ -265,7 +265,7 @@ close code `4426` 断开。放行会让新旧客户端各读一半字段，
 
 ### 4.1 什么时候会收到数据
 
-v2.0 起，传感器不再是「每 2 秒无条件推一次」，而是按真实无线设备的
+传感器不再是「每 2 秒无条件推一次」，而是按真实无线设备的
 **变化上报**规则来：只有满足下面任一条件才会产生报文。
 
 | 参数 | 含义 | 温湿度默认值 |
@@ -287,7 +287,7 @@ v2.0 起，传感器不再是「每 2 秒无条件推一次」，而是按真实
 
 ```json
 {
-  "v": "2.0",
+  "v": "1.0.0",
   "type": "state",
   "ts": 1796000000000,
   "payload": {
@@ -381,7 +381,7 @@ ws.onmessage = (e) => {
 **② 主动拉全量** —— 想立刻对账时（这也是 `resync` 背后的机制）：
 
 ```js
-ws.send(JSON.stringify({ v: "2.0", type: "snapshot", id: "sync-1", ts: Date.now(), payload: {} }));
+ws.send(JSON.stringify({ v: "1.0.0", type: "snapshot", id: "sync-1", ts: Date.now(), payload: {} }));
 ```
 
 ---
@@ -390,7 +390,7 @@ ws.send(JSON.stringify({ v: "2.0", type: "snapshot", id: "sync-1", ts: Date.now(
 
 ### 5.1 两阶段：接受 ≠ 执行
 
-v2.0 起，一条命令走**两阶段**。这不是为了多绕一步，而是因为
+一条命令走**两阶段**。这不是为了多绕一步，而是因为
 「命令已受理」和「设备已执行」在真实系统里是两件不同的事 ——
 中间隔着继电器吸合、锁舌弹出、压缩机启动这些物理耗时，
 还隔着「设备压根没响应」这种故障。
@@ -399,7 +399,7 @@ v2.0 起，一条命令走**两阶段**。这不是为了多绕一步，而是�
 
 ```json
 {
-  "v": "2.0",
+  "v": "1.0.0",
   "type": "command",
   "id": "c-8",
   "ts": 1796000000000,
@@ -412,7 +412,7 @@ v2.0 起，一条命令走**两阶段**。这不是为了多绕一步，而是�
 ```
 
 ```json
-{ "v": "2.0", "type": "ack", "id": "srv-9", "ref": "c-8",
+{ "v": "1.0.0", "type": "ack", "id": "srv-9", "ref": "c-8",
   "payload": { "ok": true, "status": "ACCEPTED", "deviceId": "light.living",
                "action": "set", "desired": { "power": true, "brightness": 60 },
                "delta": { "power": true, "brightness": 60 },
@@ -428,7 +428,7 @@ v2.0 起，一条命令走**两阶段**。这不是为了多绕一步，而是�
 的 `DEVICE_BEHAVIOR`）后，设备真正动作，网关广播：
 
 ```json
-{ "v": "2.0", "type": "state", "payload": {
+{ "v": "1.0.0", "type": "state", "payload": {
     "deviceId": "light.living", "type": "light", "room": "living",
     "state": { "power": true, "brightness": 60 },
     "stateKind": "confirmed", "ref": "c-8",
@@ -486,13 +486,18 @@ for (const b of [10, 20, 30, 40, 45, 50, 52, 55]) {
 > 给不支持的字段写值会返回 `UNSUPPORTED_CAPABILITY`（而不是含糊的 `INVALID_PARAM`）。
 > 能力表见 `server/model.py` 的 `FIELD_CAPABILITY`。
 
-人脸识别由摄像头实时画面驱动：识别到已登记人脸自动开锁并广播 `state`（`lastResult:"pass"` + `lastPerson`）；识别到未登记人脸时广播 `faceEnroll` 询问，面板可用 `enrollFace` / `dismissEnroll` 回应。
+人脸识别由画面源实时驱动：识别到已登记人脸自动开锁并广播 `state`（`lastResult:"pass"` + `lastPerson`）；识别到未登记人脸时广播 `faceEnroll` 询问，面板可用 `enrollFace` / `dismissEnroll` 回应。
+
+识别用的是 OpenCV Zoo 的 **YuNet（检测）+ SFace INT8 块量化（识别）**，
+比对的是 128 维 embedding 的**余弦距离**：`distance = 1 − cos`，`distance ≤ threshold`（默认 `0.637`）
+即判定为本人。阈值与模型说明见 `config.toml` 的 `[streams.lock_entry.face]`，
+运行时状态见 `GET /health` → `lock.face`。
 
 **常用代码片段**：
 
 ```js
 const cmd = (deviceId, action, params = {}) => ws.send(JSON.stringify({
-  v: "2.0", type: "command", id: `c-${Date.now()}`, ts: Date.now(),
+  v: "1.0.0", type: "command", id: `c-${Date.now()}`, ts: Date.now(),
   payload: { deviceId, action, params },
 }));
 
@@ -502,6 +507,9 @@ cmd("camera.living", "pan", { pan: 180 });                                    //
 cmd("camera.living", "nudge", { delta: -15 });                                // 向左微调 15°
 cmd("lock.entry", "unlock");                                                  // 远程开锁
 cmd("lock.entry", "lock");                                                    // 远程上锁
+cmd("curtain.bedroom", "set", { position: 60 });                              // 窗帘开度 60%
+cmd("curtain.bedroom", "open");                                               // 窗帘全开（position 100）
+cmd("curtain.bedroom", "close");                                              // 窗帘全闭（position 0）
 ```
 
 **离线设备不会假装成功**：
@@ -514,7 +522,7 @@ cmd("lock.entry", "lock");                                                    //
 ```
 
 > 旧版对离线设备也回 `ok:true`，调用方会以为灯已经开了 —— 这是最容易被
-> 真实设备打脸的一处。v2.0 起，网关在命令下发前先看设备是否在线。
+> 真实设备打脸的一处。网关在命令下发前先看设备是否在线。
 
 ### 5.4 命令限流
 
@@ -533,7 +541,7 @@ cmd("lock.entry", "lock");                                                    //
 场景是**服务端的批量操作**，客户端只发一个 id，网关负责改一堆设备并广播结果：
 
 ```js
-ws.send(JSON.stringify({ v: "2.0", type: "scene", id: "s-1", ts: Date.now(),
+ws.send(JSON.stringify({ v: "1.0.0", type: "scene", id: "s-1", ts: Date.now(),
                          payload: { sceneId: "away" } }));
 ```
 
@@ -557,7 +565,7 @@ ws.send(JSON.stringify({ v: "2.0", type: "scene", id: "s-1", ts: Date.now(),
 每一步都可能失败、都可能超时。这里实现同样的状态机（教学场景下进度是模拟的）：
 
 ```js
-ws.send(JSON.stringify({ v: "2.0", type: "ota", id: "o-1", ts: Date.now(),
+ws.send(JSON.stringify({ v: "1.0.0", type: "ota", id: "o-1", ts: Date.now(),
                          payload: { target: "sensor.living", version: "2.1.3" } }));
 ```
 
@@ -610,7 +618,7 @@ ws.send(JSON.stringify({ v: "2.0", type: "ota", id: "o-1", ts: Date.now(),
 
 ```js
 const t0 = performance.now();
-ws.send(JSON.stringify({ v: "2.0", type: "ping", id: "p-1", ts: Date.now(), payload: { at: t0 } }));
+ws.send(JSON.stringify({ v: "1.0.0", type: "ping", id: "p-1", ts: Date.now(), payload: { at: t0 } }));
 // 收到 pong 后：console.log("RTT", performance.now() - msg.payload.echo.at, "ms");
 ```
 
@@ -624,7 +632,7 @@ ws.send(JSON.stringify({ v: "2.0", type: "ping", id: "p-1", ts: Date.now(), payl
 设备故障走**事件通道主动推**，不是等平台来轮询 —— 轮询查不出「刚才闪过一次故障」。
 
 ```json
-{ "v": "2.0", "type": "fault", "ts": 1796000000000, "payload": {
+{ "v": "1.0.0", "type": "fault", "ts": 1796000000000, "payload": {
     "deviceId": "light.bath", "faultCode": "LAMP_BURNOUT",
     "severity": "error", "message": "灯珠损坏，无法点亮", "since": 1796000000000 } }
 ```
@@ -647,7 +655,7 @@ curl -X POST "http://localhost:8080/api/simulate?token=$MSHOUSE_TOKEN" \
 
 ## 七、错误处理
 
-v2.0 起错误**结构化**：`{ code, message, details }`。客户端按 `code` 分支，
+错误信息是**结构化**的：`{ code, message, details }`。客户端按 `code` 分支，
 不要去匹配中文文案（文案随时可能改）。
 
 **两类错误，处理方式不同**：
@@ -664,7 +672,7 @@ v2.0 起错误**结构化**：`{ code, message, details }`。客户端按 `code`
 | `INTERNAL` | 服务端内部异常 | 连接保留 |
 
 ```json
-{ "v": "2.0", "type": "error", "id": "c-8", "ts": 1796000000000,
+{ "v": "1.0.0", "type": "error", "id": "c-8", "ts": 1796000000000,
   "payload": { "code": "BAD_JSON", "message": "报文不是合法 JSON", "details": [] } }
 ```
 
@@ -675,7 +683,7 @@ if (msg.type === "error") {
 ```
 
 > **重要修正**：旧版遇到服务端异常会**静默吞掉并断开连接**，客户端只看到
-> 「莫名其妙掉线」。v2.0 起单条报文出错不再断连，且必定回一条带 `code` 的
+> 「莫名其妙掉线」。单条报文出错不再断连，且必定回一条带 `code` 的
 > `error` —— 只有鉴权与版本这两类**连接级**问题才关连接。
 
 **② 业务级失败 → `ack.payload.ok === false`**（报文合法，但设备不买账）
@@ -742,7 +750,7 @@ if (msg.type === "ack" && msg.payload.ok === false) {
 
 ```js
 ws.send(JSON.stringify({
-  v: "2.0", type: "command", id: "cmd-stream-1", ts: Date.now(),
+  v: "1.0.0", type: "command", id: "cmd-stream-1", ts: Date.now(),
   payload: { deviceId: "camera.living", action: "stream", params: { on: true } }
 }));
 ```
@@ -819,6 +827,77 @@ if (msg.type === "video" && msg.payload.kind === "camera") {
 
 **你的客户端一行都不用改。** 服务端把渲染源换成真实的 RTSP 拉流 → JPEG 转码，通道名、`video` 信令格式、`<img>` 播放方式全部不变。这就是信令与像素分离的价值——客户端只认"通道地址"，不关心像素从哪来。
 
+### 反过来：把浏览器摄像头推给网关
+
+如果网关本身没有摄像头（比如跑在服务器上），可以让**打开网页的那台设备**把自己的摄像头推上去。
+「设置 → 摄像头」卡片里选「浏览器摄像头」，或直接发一条 `setup` 报文：
+
+```js
+ws.send(JSON.stringify({
+  v: "1.0.0", type: "setup", id: "s-1", ts: Date.now(),
+  payload: { password: "<初始化口令>", name: "", address: "",
+             lockSource: { kind: "browser", index: 0, url: "" } }
+}));
+```
+
+然后按下面的节奏把帧 POST 上去（大门锁执行延迟 1.5s，**先等 `streaming` 变成 `true` 再推帧**）：
+
+```js
+// 1. 打开推流
+ws.send(JSON.stringify({
+  v: "1.0.0", type: "command", id: "c-1", ts: Date.now(),
+  payload: { deviceId: "lock.entry", action: "stream", params: { on: true } }
+}));
+
+// 2. 抓帧并 POST（像素走 HTTP，与 MJPEG 同一个分工）
+const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+const video = Object.assign(document.createElement("video"), { srcObject: stream, muted: true });
+await video.play();
+const canvas = document.createElement("canvas");
+
+setInterval(async () => {
+  if (video.readyState < 2) return;
+  canvas.width = 640;
+  canvas.height = Math.round(640 * video.videoHeight / video.videoWidth);
+  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.72));
+  await fetch("/api/lock/frame", { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+}, 500);   // 2fps，与大门锁默认推流帧率一致
+```
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/lock/frame` | 收一帧 JPEG/PNG，`Content-Type: image/jpeg`。成功 `{"ok":true,"frames":N,"connected":true}`；来源不是 `browser` 或推流没开时 `400` + `{"ok":false,"error":"..."}` |
+| `GET /health` → `lock.source` | `{ kind:"browser", opened, frameCount, lastFrameAt, error, target }`。`opened` 的含义是「最近 3 秒收到过帧」，断流会自动变回 `false`，画面回落静态底图 |
+| `GET /health` → `lock.face` | `{ ready, reason, backend, threshold, users, enrolled }`，`backend` 会告诉你实际加载的是哪个模型；`enrolled` 是带来源标签的用户清单 |
+
+> 网关**不会**对每一帧跑识别（2fps 推帧逐帧推理纯属浪费）：
+> 推上来的帧只负责「喂画面」，真正的人脸识别仍由 `_loop_lock_vision` 每秒一次统一驱动，
+> 两条路径共用同一份 `_last_vision` 状态。
+
+### 人脸登记库的读写接口
+
+设置页「人脸锁」卡片用的就是这三个接口，第三方客户端也可以直接调：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/lock/faces` | 登记库现状：`{ ready, reason, backend, threshold, users, enrolled }`。开放读取 |
+| `POST /api/lock/enroll?name=<名字>` | body 是图片（JPEG/PNG），需请求头 `X-Setup-Password`。名字留空自动命名，重名自动加序号 |
+| `DELETE /api/lock/enroll?name=<名字>` | 删除该用户（连磁盘上的人脸图一起删，重启不复活），同样需 `X-Setup-Password` |
+
+```js
+// 登记一张照片
+const blob = fileInput.files[0];
+await fetch(`/api/lock/enroll?name=${encodeURIComponent("张三")}`, {
+  method: "POST",
+  headers: { "Content-Type": blob.type, "X-Setup-Password": "<初始化口令>" },
+  body: blob,
+});
+```
+
+> 口令放在**请求头**而不是 URL：URL 会留在浏览器历史、代理日志和 `Referer` 里。
+> 读接口开放是因为内容与 `/health` 的 `lock.face` 同源，不含额外隐私。
+
 ---
 
 ## 九、初始化设置（写入物理位置）
@@ -827,8 +906,8 @@ if (msg.type === "video" && msg.payload.kind === "camera") {
 
 ### 9.1 口令从哪来
 
-v1.0 的口令是硬编码在 `server/model.py` 里的明文 `villa`，并且原样写在前端
-资源里 —— 任何人打开 F12 就能看到。v2.0 起改为**哈希校验**：
+口令不能硬编码在源码里、也不能原样出现在前端资源中 —— 那样任何人打开 F12 就能看到。
+所以这里是**哈希校验**：
 
 | 项 | 说明 |
 |---|---|
@@ -865,7 +944,7 @@ setup_password_hash = "pbkdf2_sha256$200000$<salt_b64>$<hash_b64>"
 
 ```js
 ws.send(JSON.stringify({
-  v: "2.0", type: "setup", id: "cfg-1", ts: Date.now(),
+  v: "1.0.0", type: "setup", id: "cfg-1", ts: Date.now(),
   payload: { password: "<初始化口令>", lat: 30.2741, lon: 120.1551, name: "杭州 · 西湖" },
 }));
 ```
@@ -919,7 +998,7 @@ curl http://localhost:8080/streams           # 全部视频通道的实时状态
 `/api/diagnostics` 的输出很适合排查「为什么不推了」：
 
 ```json
-{ "ok": true, "version": "2.0",
+{ "ok": true, "version": "1.0.0",
   "stats": { "clients": 1, "authedClients": 1, "outboxDropped": 0, "outboxCoalesced": 12,
              "commandsTotal": 34, "rateLimited": 0 },
   "faults": { "light.bath": [{ "code": "LAMP_BURNOUT", "severity": "error" }] },
@@ -980,8 +1059,8 @@ curl http://localhost:8080/streams           # 全部视频通道的实时状态
 
 **连上后立刻断开，close code `4426`**
 
-协议主版本不匹配。你大概率用的是 v1.0 的客户端（`v: "1.0"`），网关是 v2.0。
-把信封里的 `v` 改成 `"2.0"` 即可 —— 放行新旧混用会让「界面上某些值永远不动」，比直接报错难查得多。
+协议主版本不匹配。检查客户端信封里的 `v` 是否与网关主版本一致（网关当前为 `1.0.0`）。
+把它改成 `"1.0.0"` 即可 —— 放行新旧混用会让「界面上某些值永远不动」，比直接报错难查得多。
 
 **连上了但设备列表是空的**
 
@@ -991,7 +1070,7 @@ curl http://localhost:8080/streams           # 全部视频通道的实时状态
 
 **传感器报文很久才来一条，是不是掉线了？**
 
-不是。v2.0 起传感器按**变化上报**（对齐 Zigbee 的 `ReportableChange`）：
+不是。传感器按**变化上报**（对齐 Zigbee 的 `ReportableChange`）：
 温度变化 ≥0.2 °C 或湿度变化 ≥1 % 才发一条，最长 600 秒保活一次。
 稳态下几十秒没有报文是正常的。判断在线请用 `online` 字段或 `/api/diagnostics`，
 不要用「多久没收到报文」。
@@ -1017,7 +1096,7 @@ curl http://localhost:8080/streams           # 全部视频通道的实时状态
 
 **拖动滑杆时命令刷屏**
 
-v2.0 起网关侧已经做了**抖动合并**：连发 8 条亮度命令，只有最后一条会真正执行、
+网关侧已经做了**抖动合并**：连发 8 条亮度命令，只有最后一条会真正执行、
 只有一条 `confirmed` 广播。但你仍会收到 8 条 `ack`（受理回执）。
 `demo.html` 里还额外做了 70ms 防抖（见 `slider()` 里的 `setTimeout`），双重保险。
 

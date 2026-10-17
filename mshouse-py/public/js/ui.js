@@ -18,7 +18,7 @@ function el(tag, className, text) {
  *   配置了独立推流端口 → http://当前主机:端口/（和真实 IP 摄像头一致）；
  *   否则复用主端口     → /?stream=<通道号>（相对地址，跟页面同源）。
  *
- * v2.0 起像素通道也受鉴权保护，而 <img> 没法带请求头 —— 所以把令牌拼在查询串上。
+ * 像素通道也受鉴权保护，而 <img> 没法带请求头 —— 所以把令牌拼在查询串上。
  * 服务端同时支持 ?token= 与一次性签名地址（/?stream=x&exp=&sig=，由 /api/stream-url 签发）；
  * 页面内嵌用令牌即可，要贴给别人看（外链、iframe）请改用签名地址，见 docs/INTEGRATION.md 第八节。
  */
@@ -29,7 +29,7 @@ export function streamSrc(info) {
   return `/?stream=${info.channel}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
 }
 
-const TYPE_LABEL = { light: "灯光", sensor: "传感器", ac: "空调", camera: "摄像头", lock: "门锁" };
+const TYPE_LABEL = { light: "灯光", sensor: "传感器", ac: "空调", camera: "摄像头", lock: "门锁", curtain: "电动窗帘" };
 const ROOM_LABEL = { living: "客厅", kitchen: "厨房", bedroom: "主卧", bath: "卫生间", entry: "门厅" };
 const MODE_LABEL = { cool: "制冷", heat: "制热", fan: "送风", dry: "除湿", auto: "自动" };
 const FAN_LABEL = { low: "低风", mid: "中风", high: "高风", auto: "自动" };
@@ -115,15 +115,17 @@ export class Dashboard {
       });
     });
 
-    // 上传人脸画面：把图片二进制 POST 给网关，画面从门外草坪道路切到上传的人脸
-    const faceFile = document.getElementById("faceFile");
-    document.getElementById("faceUpload")?.addEventListener("click", () => faceFile?.click());
-    faceFile?.addEventListener("change", () => {
-      const file = faceFile.files?.[0];
-      if (file) this.h.uploadFace?.(file);
-      faceFile.value = "";
+    // 浏览器摄像头：开关、设备选择（真正的 getUserMedia 在 main.js 的 BrowserCamera 里）
+    document.getElementById("lockBrowserStart")?.addEventListener("click", () => this.h.startBrowserCam?.());
+    document.getElementById("lockBrowserStop")?.addEventListener("click", () => this.h.stopBrowserCam?.());
+    document.getElementById("lockBrowserDevice")?.addEventListener("change", (e) => {
+      this.h.selectBrowserDevice?.(e.target.value || "");
     });
-    document.getElementById("faceClear")?.addEventListener("click", () => this.h.clearFace?.());
+    document.getElementById("setupLockBrowserStart")?.addEventListener("click", () => this.h.startBrowserCam?.());
+    document.getElementById("setupLockBrowserStop")?.addEventListener("click", () => this.h.stopBrowserCam?.());
+    document.getElementById("setupLockBrowserDevice")?.addEventListener("change", (e) => {
+      this.h.selectBrowserDevice?.(e.target.value || "");
+    });
 
     const menu = document.getElementById("menuToggle");
     // 默认隐藏控制面板；只有用户上次明确选择“显示”时才保持展开
@@ -137,6 +139,24 @@ export class Dashboard {
     document.getElementById("setupBack")?.addEventListener("click", () => this._showAuthPane());
     document.getElementById("setupGeo")?.addEventListener("click", () => this._fillGeo());
     document.getElementById("setupLockKind")?.addEventListener("change", () => this._syncLockSourceFields());
+
+    // 人脸锁卡片：选照片登记 / 用摄像头抓拍登记 / 删除已登记用户
+    const enrollFile = document.getElementById("setupEnrollFile");
+    document.getElementById("setupEnrollPick")?.addEventListener("click", () => enrollFile?.click());
+    enrollFile?.addEventListener("change", () => {
+      const file = enrollFile.files?.[0];
+      if (file) this.h.enrollFace?.($("#setupEnrollName")?.value || "", file);
+      enrollFile.value = "";
+    });
+    document.getElementById("setupEnrollShoot")?.addEventListener("click", () => {
+      this.h.captureEnroll?.($("#setupEnrollName")?.value || "");
+    });
+    // 用户列表是动态渲染的，用事件委托，免得每渲染一次重绑一遍
+    document.getElementById("setupFaceUsers")?.addEventListener("click", (e) => {
+      const name = e.target?.dataset?.faceRemove;
+      if (name) this.h.removeFace?.(name);
+    });
+
     document.getElementById("setupForm")?.addEventListener("submit", (e) => {
       e.preventDefault();
       // 同一个 form：口令页回车/点「下一步」走校验，卡片页点「保存设置」走提交
@@ -251,6 +271,78 @@ export class Dashboard {
     if (auth) auth.hidden = true;
     if (cards) cards.hidden = false;
     this._prefillSetupCards();
+    // 人脸登记库不在快照里（含用户名单，属于按需读取），开卡片时单独拉一次
+    this.h.refreshFaces?.();
+  }
+
+  /** 设置弹窗里已验证过的口令：登记 / 删除人脸时随请求头发给网关 */
+  setupPassword() {
+    return this._setupPassword || "";
+  }
+
+  /* ---------------- 人脸锁：登记库列表 ---------------- */
+
+  setFaceInfo(info) {
+    this.faceInfo = info || null;
+    const status = $("#setupFaceStatus");
+    if (status) {
+      if (!info) {
+        status.textContent = "正在读取人脸登记库…";
+      } else {
+        const count = (info.enrolled || []).length;
+        const parts = [
+          info.backend ? `模型 ${info.backend}` : null,
+          info.threshold != null ? `阈值 ${info.threshold}` : null,
+          `已登记 ${count} 人`,
+        ].filter(Boolean);
+        if (info.ready === false) parts.push(`尚未就绪：${info.reason || "未知原因"}`);
+        status.textContent = parts.join(" · ");
+      }
+    }
+
+    const host = $("#setupFaceUsers");
+    if (!host) return;
+    host.innerHTML = "";
+    const users = info?.enrolled || [];
+    if (!users.length) {
+      host.appendChild(el("div", "face-users-empty",
+        "还没有登记任何人脸。上传一张正脸照，或在推流时用「登记用户」把门外的人登记进来。"));
+      return;
+    }
+    for (const u of users) {
+      const row = el("div", "face-user");
+      const name = el("span", "face-user-name", u.name);
+      name.title = u.name;
+      const kind = el("span", `face-user-kind${u.kind === "primary" ? " primary" : ""}`,
+        u.kind === "primary" ? "内置登记照" : "现场登记");
+      const del = el("button", "mini danger", "删除");
+      del.type = "button";
+      del.dataset.faceRemove = u.name;
+      del.title = `删除登记用户「${u.name}」`;
+      row.append(name, kind, del);
+      host.appendChild(row);
+    }
+  }
+
+  /** 登记过程中的提示（busy = 正在上传；error 有值时按错误样式显示） */
+  setFaceEnrollBusy(busy, message, error) {
+    const hint = $("#setupEnrollHint");
+    const pick = $("#setupEnrollPick");
+    const shoot = $("#setupEnrollShoot");
+    if (pick) pick.disabled = !!busy;
+    if (shoot) shoot.disabled = !!busy;
+    if (!hint) return;
+    if (error) {
+      hint.textContent = `⚠ ${error}`;
+      hint.style.color = "#ffb4a8";
+      return;
+    }
+    hint.style.color = "";
+    if (busy) {
+      hint.textContent = message || "正在登记…";
+    } else if (message) {
+      hint.textContent = `✓ ${message}`;
+    }
   }
 
   /** 口令通过后用最新快照预填卡片（未配置时网关下发温州默认值） */
@@ -272,14 +364,90 @@ export class Dashboard {
 
   setLockSource(source) {
     this.lockSource = source || null;
+    // 浏览器摄像头面板只在「画面来源 = 浏览器摄像头」时出现
+    const box = $("#lockBrowserBox");
+    if (box) box.hidden = (source?.kind || "image") !== "browser";
   }
 
   _syncLockSourceFields() {
     const kind = $("#setupLockKind")?.value || "image";
     const idxWrap = $("#setupLockIndexWrap");
     const urlWrap = $("#setupLockUrlWrap");
+    const camWrap = $("#setupLockBrowserWrap");
     if (idxWrap) idxWrap.hidden = kind !== "camera";
     if (urlWrap) urlWrap.hidden = kind !== "stream";
+    if (camWrap) camWrap.hidden = kind !== "browser";
+    const hint = $("#setupSourceHint");
+    if (hint) {
+      hint.textContent = kind === "browser"
+        ? "浏览器摄像头：画面由打开本页的设备采集并推给网关，因此只有本页开着的时候才有画面。"
+        : "画面来源切换后立即生效并记忆，重启服务也会保留。";
+    }
+    if (kind === "browser") this.h.listBrowserCams?.();
+  }
+
+  /* ---------------- 浏览器摄像头 ---------------- */
+
+  /** 把设备列表填进两个下拉框（画面面板 + 设置弹窗） */
+  setBrowserCamDevices(devices, current) {
+    const list = devices || [];
+    for (const id of ["lockBrowserDevice", "setupLockBrowserDevice"]) {
+      const sel = document.getElementById(id);
+      if (!sel) continue;
+      const keep = sel.value;
+      sel.innerHTML = "";
+      const auto = document.createElement("option");
+      auto.value = "";
+      auto.textContent = "默认摄像头";
+      sel.appendChild(auto);
+      list.forEach((d, i) => {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `摄像头 ${i + 1}`;
+        sel.appendChild(opt);
+      });
+      const want = current ?? keep;
+      sel.value = list.some((d) => d.deviceId === want) ? want : "";
+    }
+  }
+
+  /** 浏览器摄像头推流状态（由 BrowserCamera 回调驱动） */
+  setBrowserCamStatus(status) {
+    const s = status || {};
+    const running = !!s.running;
+    for (const id of ["lockBrowserStart", "setupLockBrowserStart"]) {
+      const btn = document.getElementById(id);
+      if (btn) btn.hidden = running;
+    }
+    for (const id of ["lockBrowserStop", "setupLockBrowserStop"]) {
+      const btn = document.getElementById(id);
+      if (btn) btn.hidden = !running;
+    }
+    const wrap = $("#setupLockBrowserPreviewWrap");
+    if (wrap) wrap.hidden = !running;
+    // 摄像头开着才谈得上「抓拍登记」
+    const shoot = $("#setupEnrollShoot");
+    if (shoot) shoot.hidden = !running;
+
+    const node = $("#lockBrowserStatus");
+    if (!node) return;
+    if (s.error) {
+      node.textContent = `⚠ ${s.error}`;
+      node.style.color = "#ffb4a8";
+      return;
+    }
+    node.style.color = "";
+    if (!running) {
+      node.textContent = "用本机浏览器能访问的摄像头推流给网关做人脸识别。";
+    } else if (!s.pushing) {
+      node.textContent = `摄像头已开启${s.deviceLabel ? `（${s.deviceLabel}）` : ""}`
+        + "，但还没有推流 —— 点上面的「推送画面」后网关才会开始识别。";
+    } else {
+      node.textContent = `摄像头已开启${s.deviceLabel ? `（${s.deviceLabel}）` : ""}`
+        + `，正在推流：已推 ${s.frames || 0} 帧`
+        + (s.dropped ? `，丢帧 ${s.dropped}` : "")
+        + "。";
+    }
   }
 
   closeSetup() {
@@ -631,6 +799,51 @@ export class Dashboard {
         const text = r === "pass" ? "识别通过" : r === "reject" ? "识别拒绝" : locked ? "已上锁" : "已开锁";
         meta.textContent = `${text}${s.lastPerson ? " · " + s.lastPerson : ""} · 电量 ${s.battery ?? "--"}%`;
       };
+    } else if (d.type === "curtain") {
+      const btn = el("button", "primary", "关窗帘");
+      btn.addEventListener("click", () => send(btn.dataset.open === "1" ? "close" : "open", {}));
+
+      const posWrap = el("label");
+      const cap = el("span", null, "开度");
+      const val = el("b", null, "100%");
+      const range = el("input");
+      range.type = "range"; range.min = 0; range.max = 100; range.step = 5;
+      let timer = null;
+      range.addEventListener("input", () => {
+        val.textContent = `${range.value}%`;
+        clearTimeout(timer);
+        // 拖动过程中只在松手后发一次：窗帘电机不该被几十条中间指令连打
+        timer = setTimeout(() => send("set", { position: Number(range.value) }), 120);
+      });
+      posWrap.append(cap, val, range);
+      posWrap.style.display = "block";
+
+      const presets = el("div", "row");
+      for (const [label, p] of [["全关", 0], ["半开", 50], ["全开", 100]]) {
+        const b = el("button", "mini", label);
+        b.addEventListener("click", () => send("set", { position: p }));
+        presets.appendChild(b);
+      }
+      const btnRow = el("div", "row");
+      btnRow.appendChild(btn);
+      ctrl.append(btnRow, posWrap, presets);
+
+      const meta = el("p", "meta", "—");
+      ctrl.appendChild(meta);
+
+      api.sync = (s) => {
+        const pos = Math.round(s.position ?? 0);
+        const open = pos > 0;
+        btn.dataset.open = open ? "1" : "0";
+        btn.textContent = open ? "关窗帘" : "开窗帘";
+        btn.classList.toggle("primary", !open);
+        range.value = pos;
+        val.textContent = `${pos}%`;
+        // 窗帘没有「电源」概念，用开度说话；闭合与拉开对光照的影响完全不同
+        meta.textContent = pos === 0 ? "完全闭合 · 遮光"
+          : pos >= 100 ? "完全拉开 · 采光"
+          : `开启 ${pos}% · 部分采光`;
+      };
     }
 
     if (api.sync) api.sync(d.state || {});
@@ -665,6 +878,7 @@ export class Dashboard {
       case "ac": return s.power ? `${MODE_LABEL[s.mode] || s.mode} · ${s.targetTemp}°C · ${FAN_LABEL[s.fan] || s.fan}` : "关";
       case "camera": return `${s.power ? "在线" : "离线"} · PAN ${Math.round(s.pan ?? 0)}°${s.armed ? " · 布防" : ""}${s.motion ? " · 移动" : ""}`;
       case "lock": return `${s.locked ? "已上锁" : "已开锁"} · ${s.lastResult === "pass" ? "人脸通过" : s.lastResult === "reject" ? "人脸拒绝" : "待机"}`;
+      case "curtain": return (s.position ?? 0) === 0 ? "已闭合" : `开度 ${Math.round(s.position ?? 0)}%`;
       default: return "—";
     }
   }

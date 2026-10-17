@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MSHouse 镜像家居 · 智能家居数字孪生教学</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2b15a'/%3E%3Cpath d='M8 16l8-6 8 6v9H8z' fill='%231b1408'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/css/app.css?v=24" />
+  <link rel="stylesheet" href="/css/app.css?v=25" />
 </head>
 <body class="panel-hidden">
   <canvas id="viewport"></canvas>
@@ -20,7 +20,7 @@
     </div>
     <div class="scenes" id="scenes"></div>
     <button class="chip" id="setupBtn" type="button">设置</button>
-    <a class="chip" id="docsBtn" href="/docs.html?v=24" target="_blank" rel="noopener">文档</a>
+    <a class="chip" id="docsBtn" href="/docs.html?v=25" target="_blank" rel="noopener">文档</a>
     <button class="chip" id="menuToggle" type="button" aria-pressed="false">控制</button>
   </header>
 
@@ -85,22 +85,21 @@
           <button class="mini" id="unlockNow">手动开锁</button>
           <button class="mini" id="lockNow">手动上锁</button>
         </div>
-        <div class="row" style="margin-top:8px">
-          <button class="mini" id="faceUpload">上传人脸画面</button>
-          <button class="mini" id="faceClear">恢复门外画面</button>
-          <input type="file" id="faceFile" accept="image/*" hidden />
+
+        <!-- 浏览器摄像头：只有「画面来源 = 浏览器摄像头」时才显示 -->
+        <div id="lockBrowserBox" hidden style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+          <div class="row">
+            <select id="lockBrowserDevice" style="flex:1;min-width:140px">
+              <option value="">默认摄像头</option>
+            </select>
+            <button class="mini primary" id="lockBrowserStart" type="button">开启浏览器摄像头</button>
+            <button class="mini" id="lockBrowserStop" type="button" hidden>关闭</button>
+          </div>
+          <p class="meta" id="lockBrowserStatus" style="margin-top:8px">
+            用本机浏览器能访问的摄像头推流给网关做人脸识别。
+          </p>
         </div>
       </div>
-      <p class="meta" style="margin:10px 4px 0;line-height:1.6">
-        画面走独立 HTTP 流，不占用 WebSocket：
-        <code>GET /?stream=233666</code> 返回 MJPEG，浏览器 <code>&lt;img&gt;</code> 直接能播。
-        大门锁默认 2fps，画面随当地天气与日落自动切换（晴/雨/雪/雾/夜）；
-        上传人脸或摄像头实时帧经内置人脸量化模型比对登记库（<code>camera/face.jpg</code>
-        与运行时登记用户），距离 ≤ 阈值即自动开锁；推送中检测到未登记人脸会提示是否登记为新用户，
-        也可用按钮手动开锁 / 上锁。
-        帧率、天气画面、视频源（本机摄像头 / RTSP 流）、人脸阈值都在
-        <code>config.toml</code> 的 <code>[streams.lock_entry]</code> 里配置。
-      </p>
     </section>
     <section class="pane" id="pane-wire">
       <div class="row" style="margin-bottom:8px">
@@ -161,47 +160,96 @@
           <p>口令已通过。各项均可留空：留空的项保持现有设置不变。</p>
         </header>
 
-        <section class="setup-card">
-          <h3>住宅位置</h3>
-          <label>地点名称
-            <input id="setupName" name="name" maxlength="40" placeholder="默认：浙江温州" />
-          </label>
-          <label>详细地址
-            <input id="setupAddress" name="address" maxlength="120"
-                   placeholder="浙江省温州市瓯海区郭溪街道科高路 1 号（温州科技高级中学）" />
-          </label>
-          <div class="pair">
-            <label>纬度
-              <input id="setupLat" name="lat" type="number" step="0.0001" min="-90" max="90" placeholder="27.9925" />
+        <div class="setup-grid">
+          <!-- 卡片 ①：地点 -->
+          <section class="setup-card" id="setupCardSite">
+            <h3>地点</h3>
+            <label>地点名称
+              <input id="setupName" name="name" maxlength="40" placeholder="默认：浙江温州" />
             </label>
-            <label>经度
-              <input id="setupLon" name="lon" type="number" step="0.0001" min="-180" max="180" placeholder="120.5801" />
+            <label>详细地址
+              <input id="setupAddress" name="address" maxlength="120"
+                     placeholder="浙江省温州市瓯海区郭溪街道科高路 1 号（温州科技高级中学）" />
             </label>
-          </div>
-          <div class="row">
-            <button class="mini" type="button" id="setupGeo">使用当前位置</button>
-            <span class="meta" id="setupHint">经纬度留空则不重新定位；填写后按当地预报初始化室外温度与日照。</span>
-          </div>
-        </section>
+            <div class="pair">
+              <label>纬度
+                <input id="setupLat" name="lat" type="number" step="0.0001" min="-90" max="90" placeholder="27.9925" />
+              </label>
+              <label>经度
+                <input id="setupLon" name="lon" type="number" step="0.0001" min="-180" max="180" placeholder="120.5801" />
+              </label>
+            </div>
+            <div class="row">
+              <button class="mini" type="button" id="setupGeo">使用当前位置</button>
+              <span class="meta" id="setupHint">经纬度留空则不重新定位；填写后按当地预报初始化室外温度与日照。</span>
+            </div>
+          </section>
 
-        <section class="setup-card">
-          <h3>大门锁画面来源</h3>
-          <label>画面来源
-            <select id="setupLockKind">
-              <option value="image">静态画面（按天气自动切换）</option>
-              <option value="camera">本机摄像头</option>
-              <option value="stream">网络视频流（RTSP / HTTP-MJPEG）</option>
-            </select>
-          </label>
-          <label id="setupLockIndexWrap" hidden>摄像头序号
-            <input id="setupLockIndex" type="number" min="0" max="15" step="1" value="0" />
-          </label>
-          <label id="setupLockUrlWrap" hidden>视频流地址
-            <input id="setupLockUrl" type="text" maxlength="300"
-                   placeholder="rtsp://user:pass@192.168.1.10:554/stream1" />
-          </label>
-          <p class="meta" id="setupSourceHint">画面来源切换后立即生效并记忆，重启服务也会保留。</p>
-        </section>
+          <!-- 卡片 ②：摄像头 -->
+          <section class="setup-card" id="setupCardCamera">
+            <h3>摄像头</h3>
+            <label>画面来源
+              <select id="setupLockKind">
+                <option value="image">静态画面（按天气自动切换）</option>
+                <option value="camera">本机摄像头（网关所在机器的摄像头）</option>
+                <option value="stream">网络视频流（RTSP / HTTP-MJPEG）</option>
+                <option value="browser">浏览器摄像头（用打开本页的这台设备的摄像头）</option>
+              </select>
+            </label>
+            <label id="setupLockIndexWrap" hidden>摄像头序号
+              <input id="setupLockIndex" type="number" min="0" max="15" step="1" value="0" />
+            </label>
+            <label id="setupLockUrlWrap" hidden>视频流地址
+              <input id="setupLockUrl" type="text" maxlength="300"
+                     placeholder="rtsp://user:pass@192.168.1.10:554/stream1" />
+            </label>
+
+            <!-- 浏览器摄像头：前端 getUserMedia 抓帧后 POST 给网关 -->
+            <div id="setupLockBrowserWrap" hidden>
+              <label>摄像头设备
+                <select id="setupLockBrowserDevice">
+                  <option value="">默认摄像头</option>
+                </select>
+              </label>
+              <div class="row" style="margin-top:8px">
+                <button class="mini primary" type="button" id="setupLockBrowserStart">开启摄像头</button>
+                <button class="mini" type="button" id="setupLockBrowserStop" hidden>关闭</button>
+              </div>
+              <div class="video-box" id="setupLockBrowserPreviewWrap" hidden style="margin-top:8px">
+                <span class="tag">LOCAL CAM</span>
+                <video id="setupLockBrowserPreview" playsinline muted></video>
+              </div>
+            </div>
+
+            <p class="meta" id="setupSourceHint">画面来源切换后立即生效并记忆，重启服务也会保留。</p>
+          </section>
+
+          <!-- 卡片 ③：人脸锁（登记库管理，跨两列） -->
+          <section class="setup-card setup-card-wide" id="setupCardFace">
+            <h3>人脸锁</h3>
+            <p class="meta" id="setupFaceStatus">正在读取人脸登记库…</p>
+
+            <div class="face-users" id="setupFaceUsers"></div>
+
+            <div class="setup-sep"></div>
+
+            <div class="face-enroll">
+              <label>新用户姓名
+                <input id="setupEnrollName" type="text" maxlength="20"
+                       placeholder="留空则自动命名为「新住户N」" />
+              </label>
+              <div class="row">
+                <button class="mini primary" type="button" id="setupEnrollPick">选择照片登记</button>
+                <button class="mini" type="button" id="setupEnrollShoot" hidden>用摄像头抓拍登记</button>
+                <input type="file" id="setupEnrollFile" accept="image/*" hidden />
+              </div>
+              <p class="meta" id="setupEnrollHint">
+                登记用的是 SFace 特征（不是照片本身），照片只留一份在
+                <code>camera/faces/</code> 供重启后重建特征库。请用正脸、五官清晰、光线均匀的照片。
+              </p>
+            </div>
+          </section>
+        </div>
 
         <p class="setup-error" id="setupError" hidden></p>
         <footer>
@@ -213,7 +261,7 @@
     </form>
   </dialog>
 
-  <!-- 连接设置：v2.0 起 /ws 需要访问令牌，浏览器只能通过子协议携带 -->
+  <!-- 连接设置：/ws 需要访问令牌，浏览器只能通过子协议携带 -->
   <dialog class="setup" id="connDialog">
     <form id="connForm" method="dialog">
       <header>
@@ -241,6 +289,6 @@
       }
     }
   </script>
-  <script type="module" src="/js/main.js?v=24"></script>
+  <script type="module" src="/js/main.js?v=25"></script>
 </body>
 </html>

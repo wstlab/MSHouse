@@ -255,6 +255,17 @@ export const DEVICE_CATALOG = [
     ],
     "channel": "233667"
   },
+  {
+    "id": "curtain.bedroom",
+    "type": "curtain",
+    "name": "主卧电动窗帘",
+    "room": "bedroom",
+    "floor": 2,
+    "capabilities": [
+      "switch",
+      "position"
+    ]
+  },
 ];
 
 export const SCENES = {
